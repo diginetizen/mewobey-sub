@@ -533,7 +533,7 @@ SERVER_IP=$(hostname -I | awk '{print $1}')
 
 echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════╗${RESET}"
-echo -e "${GREEN}║   Install complete!                       ║${RESET}"
+echo -e "${GREEN}║   Install complete!                      ║${RESET}"
 echo -e "${GREEN}╚══════════════════════════════════════════╝${RESET}"
 echo ""
 echo -e "  ${CYAN}Installed to:${RESET}   $INSTALL_DIR"
