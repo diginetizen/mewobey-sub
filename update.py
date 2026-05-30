@@ -1,12 +1,13 @@
 import os
 import json
 import time
+import hashlib
 import secrets
 import string
 import subprocess
 import requests
-from pathlib import Path
-from typing import Dict, List, Any, Optional
+import sys
+from typing import Dict, List
 
 
 # =========================
@@ -15,20 +16,18 @@ from typing import Dict, List, Any, Optional
 
 class Config:
     def __init__(self):
-        with open("config.json", "r") as f:
-            data = json.load(f)
+        with open("config.json") as f:
+            d = json.load(f)
 
-        self.panel_url = data["panel_url"].rstrip("/")
-        self.api_token = data["api_token"]
+        self.panel_url = d["panel_url"].rstrip("/")
+        self.api_token = d["api_token"]
+        self.repo = d["github_repository"]
+        self.user = d["github_username"]
+        self.branch = d["github_branch"]
 
-        self.github_username = data["github_username"]
-        self.github_repo = data["github_repository"]
-        self.branch = data["github_branch"]
-
-        self.filename_length = data.get("filename_length", 32)
-
-        self.timeout = data.get("request_timeout", 20)
-        self.retries = data.get("request_retries", 3)
+        self.filename_length = d.get("filename_length", 32)
+        self.timeout = d.get("request_timeout", 20)
+        self.retries = d.get("request_retries", 3)
 
 
 # =========================
@@ -38,273 +37,190 @@ class Config:
 ALPHABET = string.ascii_letters + string.digits
 
 
-def random_filename(length: int = 32) -> str:
-    return "".join(secrets.choice(ALPHABET) for _ in range(length)) + ".txt"
+def gen_filename(n=32):
+    return "".join(secrets.choice(ALPHABET) for _ in range(n)) + ".txt"
+
+
+def hash_content(data: List[str]) -> str:
+    return hashlib.sha256("\n".join(data).encode()).hexdigest()
 
 
 # =========================
-# API CLIENT
+# API
 # =========================
 
-class XUIClient:
-    def __init__(self, config: Config):
-        self.config = config
+class API:
+    def __init__(self, c: Config):
+        self.c = c
 
-    def _headers(self):
-        return {
-            "Authorization": f"Bearer {self.config.api_token}"
-        }
+    def headers(self):
+        return {"Authorization": f"Bearer {self.c.api_token}"}
 
-    def get_clients(self) -> List[Dict[str, Any]]:
-        url = f"{self.config.panel_url}/panel/api/clients/list"
+    def clients(self):
+        url = f"{self.c.panel_url}/panel/api/clients/list"
+        r = requests.get(url, headers=self.headers(), timeout=self.c.timeout)
+        return r.json().get("obj", [])
 
-        for _ in range(self.config.retries):
-            try:
-                r = requests.get(
-                    url,
-                    headers=self._headers(),
-                    timeout=self.config.timeout
-                )
-                data = r.json()
-
-                if data.get("success"):
-                    return data.get("obj", [])
-
-            except Exception:
-                time.sleep(1)
-
-        return []
-
-    def get_sub_links(self, sub_id: str) -> List[str]:
-        url = f"{self.config.panel_url}/panel/api/clients/subLinks/{sub_id}"
-
-        try:
-            r = requests.get(
-                url,
-                headers=self._headers(),
-                timeout=self.config.timeout
-            )
-            data = r.json()
-
-            if data.get("success"):
-                return data.get("obj", [])
-
-        except Exception:
-            pass
-
-        return []
+    def subs(self, sub_id):
+        url = f"{self.c.panel_url}/panel/api/clients/subLinks/{sub_id}"
+        r = requests.get(url, headers=self.headers(), timeout=self.c.timeout)
+        return r.json().get("obj", [])
 
 
 # =========================
 # STORAGE
 # =========================
 
-class Storage:
+class Store:
     def __init__(self):
-        self.subs_dir = Path("subs")
-        self.subs_dir.mkdir(exist_ok=True)
+        self.map_file = "submap.json"
+        self.subs_dir = "subs"
 
-        self.map_file = Path("submap.json")
+        os.makedirs(self.subs_dir, exist_ok=True)
 
-        if not self.map_file.exists():
-            self.map_file.write_text("{}")
+        if not os.path.exists(self.map_file):
+            with open(self.map_file, "w") as f:
+                json.dump({}, f)
 
-    def load_map(self) -> Dict:
-        return json.loads(self.map_file.read_text())
+    def load(self):
+        return json.load(open(self.map_file))
 
-    def save_map(self, data: Dict):
-        self.map_file.write_text(json.dumps(data, indent=2))
+    def save(self, data):
+        json.dump(data, open(self.map_file, "w"), indent=2)
 
-    def write_sub(self, filename: str, links: List[str]):
-        path = self.subs_dir / filename
-        path.write_text("\n".join(links))
+    def write(self, fn, links):
+        open(f"{self.subs_dir}/{fn}", "w").write("\n".join(links))
 
-    def delete_file(self, filename: str):
-        path = self.subs_dir / filename
-        if path.exists():
-            path.unlink()
+    def delete(self, fn):
+        try:
+            os.remove(f"{self.subs_dir}/{fn}")
+        except:
+            pass
 
 
 # =========================
-# GIT MANAGER
+# GIT
 # =========================
 
-class GitManager:
-    def commit_and_push(self, message: str):
-        subprocess.run(["git", "add", "."], check=False)
-        result = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
+class Git:
+    def commit(self, msg):
+        subprocess.call(["git", "add", "."])
+        status = subprocess.getoutput("git status --porcelain")
 
-        if not result.stdout.strip():
+        if not status.strip():
             return
 
-        subprocess.run(["git", "commit", "-m", message], check=False)
-        subprocess.run(["git", "push", "origin", "main"], check=False)
-class SyncEngine:
-    def __init__(self, config: Config, api: XUIClient, storage: Storage):
-        self.config = config
-        self.api = api
-        self.storage = storage
+        subprocess.call(["git", "commit", "-m", msg])
+        subprocess.call(["git", "push", "origin", "main"])
 
-        self.map = self.storage.load_map()
 
-    def build_github_url(self, filename: str) -> str:
-        return (
-            f"https://raw.githubusercontent.com/"
-            f"{self.config.github_username}/"
-            f"{self.config.github_repo}/"
-            f"{self.config.branch}/subs/{filename}"
-        )
+# =========================
+# ENGINE
+# =========================
+
+class Engine:
+    def __init__(self):
+        self.c = Config()
+        self.api = API(self.c)
+        self.store = Store()
+        self.git = Git()
+
+        self.map = self.store.load()
 
     def sync(self):
-        clients = self.api.get_clients()
-        current_subids = set()
+        clients = self.api.clients()
 
-        updated_map = self.map.copy()
+        seen = set()
+        updated = {}
 
-        # -------------------------
-        # Process active clients
-        # -------------------------
         for c in clients:
             email = c.get("email")
             sub_id = c.get("subId")
 
-            if not email or not sub_id:
+            if not sub_id:
                 continue
 
-            current_subids.add(sub_id)
+            seen.add(sub_id)
 
-            links = self.api.get_sub_links(sub_id)
-
-            # If no links, skip safely
+            links = self.api.subs(sub_id)
             if not links:
                 continue
 
-            # Existing record?
-            existing = updated_map.get(sub_id)
+            old = self.map.get(sub_id)
 
-            if existing:
-                filename = existing["filename"]
+            if old:
+                fn = old["filename"]
+                old_hash = old.get("hash")
             else:
-                filename = random_filename(self.config.filename_length)
+                fn = gen_filename(self.c.filename_length)
+                old_hash = None
 
-            # Write subscription file
-            self.storage.write_sub(filename, links)
+            new_hash = hash_content(links)
 
-            github_url = self.build_github_url(filename)
+            # skip if no change
+            if old_hash == new_hash:
+                updated[sub_id] = old
+                continue
 
-            updated_map[sub_id] = {
+            self.store.write(fn, links)
+
+            url = f"https://raw.githubusercontent.com/{self.c.user}/{self.c.repo}/{self.c.branch}/subs/{fn}"
+
+            updated[sub_id] = {
                 "email": email,
-                "filename": filename,
-                "github_url": github_url,
-                "updated_at": int(time.time())
+                "filename": fn,
+                "github_url": url,
+                "hash": new_hash,
+                "updated": int(time.time())
             }
 
-        # -------------------------
-        # Remove deleted users
-        # -------------------------
-        to_delete = []
+        # delete removed users
+        for k in list(self.map.keys()):
+            if k not in seen:
+                self.store.delete(self.map[k]["filename"])
 
-        for sub_id in updated_map:
-            if sub_id not in current_subids:
-                to_delete.append(sub_id)
+        self.map = updated
+        self.store.save(self.map)
 
-        for sub_id in to_delete:
-            record = updated_map[sub_id]
-            self.storage.delete_file(record["filename"])
-            del updated_map[sub_id]
+        self.git.commit("sync subscriptions")
 
-        # Save map
-        self.storage.save_map(updated_map)
-        self.map = updated_map
-
-def run_sync():
-    config = Config()
-    api = XUIClient(config)
-    storage = Storage()
-
-    engine = SyncEngine(config, api, storage)
-    engine.sync()
-
-    print("Sync completed successfully.")
+        print("sync done")
 
 
-def rotate(email: str):
-    config = Config()
-    api = XUIClient(config)
-    storage = Storage()
+# =========================
+# DAEMON
+# =========================
 
-    data = storage.load_map()
+def daemon(interval=21600):
+    while True:
+        try:
+            Engine().sync()
+        except Exception as e:
+            print("error:", e)
 
-    # find subId by email
-    target = None
-    for sub_id, info in data.items():
-        if info["email"] == email:
-            target = sub_id
-            break
-
-    if not target:
-        print("User not found")
-        return
-
-    links = api.get_sub_links(target)
-
-    if not links:
-        print("No subscription links found")
-        return
-
-    old = data[target]
-
-    # delete old file
-    storage.delete_file(old["filename"])
-
-    # new file
-    new_file = random_filename(config.filename_length)
-    storage.write_sub(new_file, links)
-
-    new_url = f"https://raw.githubusercontent.com/{config.github_username}/{config.github_repo}/{config.branch}/subs/{new_file}"
-
-    data[target]["filename"] = new_file
-    data[target]["github_url"] = new_url
-    data[target]["rotated_at"] = int(time.time())
-
-    storage.save_map(data)
-
-    print("Rotation completed")
+        time.sleep(interval)
 
 
-def lookup(email: str):
-    storage = Storage()
-    data = storage.load_map()
-
-    for sub_id, info in data.items():
-        if info["email"] == email:
-            print("Email:", email)
-            print("SubID:", sub_id)
-            print("File:", info["filename"])
-            print("URL:", info["github_url"])
-            return
-
-    print("User not found")
+# =========================
+# CLI
+# =========================
 
 if __name__ == "__main__":
-    import sys
+    if len(sys.argv) < 2:
+        Engine().sync()
 
-    if len(sys.argv) == 1:
-        run_sync()
-
-    elif sys.argv[1] == "rotate":
-        rotate(sys.argv[2])
-
-    elif sys.argv[1] == "lookup":
-        lookup(sys.argv[2])
+    elif sys.argv[1] == "daemon":
+        interval = int(sys.argv[3]) if len(sys.argv) > 3 else 21600
+        daemon(interval)
 
     elif sys.argv[1] == "sync":
-        run_sync()
+        Engine().sync()
 
-    else:
-        print("Usage:")
-        print("  python update.py sync")
-        print("  python update.py rotate email")
-        print("  python update.py lookup email")
+    elif sys.argv[1] == "lookup":
+        email = sys.argv[2]
+        data = json.load(open("submap.json"))
 
-
+        for k, v in data.items():
+            if v["email"] == email or k == email:
+                print(v)
+                break
