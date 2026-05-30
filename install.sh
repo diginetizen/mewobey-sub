@@ -541,14 +541,12 @@ echo ""
 
 if [ "$ENABLE_UI" = "y" ]; then
     if [ "$ENABLE_NGINX" = "y" ] && [ -n "$DOMAIN" ]; then
-        if [ "$INSTALL_CERT" = "y" ]; then
-            echo -e "  ${CYAN}Web UI:${RESET}   https://${DOMAIN}"
-            echo -e "            http://${DOMAIN}"
-        else
-            echo -e "  ${CYAN}Web UI:${RESET}   http://${DOMAIN}"
-        fi
+        echo -e "  ${CYAN}Web UI:${RESET}   http://${SERVER_IP}:${UI_PORT}"
+        echo -e "            https://${DOMAIN}"
+        echo -e "            http://${DOMAIN}"
     else
         echo -e "  ${CYAN}Web UI:${RESET}   http://${SERVER_IP}:${UI_PORT}"
+        echo -e "            http://${SERVER_IP}"
     fi
     echo ""
 fi
