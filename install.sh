@@ -2,74 +2,79 @@
 
 set -e
 
-echo "INSTALL XUI SYSTEM"
+echo "===================================="
+echo "  XUI SUBSYNC AUTO INSTALLER v2"
+echo "===================================="
 
-read -p "GitHub user/repo (e.g. name/repo): " REPO
-read -p "Panel URL: " PANEL
-read -p "API Token: " TOKEN
-read -p "Domain (optional): " DOMAIN
+# -------------------------
+# INPUT SECTION (SAFE DEFAULTS)
+# -------------------------
+
+read -p "Panel URL: " PANEL_URL
+read -p "API Token: " API_TOKEN
+
+echo ""
+echo "GitHub setup:"
+echo "1) user/repo (recommended)"
+echo "2) full https URL"
+read -p "Choose (1/2): " GIT_MODE
+
+if [ "$GIT_MODE" = "1" ]; then
+    read -p "GitHub repo (e.g. diginetizen/mewobey-sub): " GITHUB_REPO
+    GITHUB_URL=""
+else
+    read -p "GitHub full URL: " GITHUB_URL
+    GITHUB_REPO=""
+fi
+
+read -p "Enable Web UI? (y/n): " ENABLE_UI
+read -p "Web UI Port (default 2086): " UI_PORT
+UI_PORT=${UI_PORT:-2086}
+
+read -p "Sync interval seconds (default 21600 = 6h): " INTERVAL
+INTERVAL=${INTERVAL:-21600}
+
+# -------------------------
+# INSTALL DEPENDENCIES
+# -------------------------
 
 apt update
-apt install -y git python3 python3-venv nginx certbot python3-certbot-nginx
-
-# SSH
-ssh-keygen -t rsa -b 4096 -N "" -f ~/.ssh/id_rsa || true
-
-echo "ADD THIS TO GITHUB:"
-cat ~/.ssh/id_rsa.pub
-read -p "Press ENTER after adding SSH key"
-
-# clone
-rm -rf /opt/xui-subsync
-git clone git@github.com:$REPO.git /opt/xui-subsync
-
-cd /opt/xui-subsync
+apt install -y python3 python3-venv git nginx
 
 python3 -m venv venv
 source venv/bin/activate
 pip install requests flask
 
+# -------------------------
+# CONFIG BUILD
+# -------------------------
+
 cat > config.json <<EOF
 {
-  "panel_url": "$PANEL",
-  "filename_length": 32
+  "panel_url": "$PANEL_URL",
+  "api_token": "$API_TOKEN",
+  "github_repo": "$GITHUB_REPO",
+  "github_repo_url": "$GITHUB_URL",
+  "github_branch": "main",
+  "filename_length": 32,
+  "request_timeout": 20,
+  "request_retries": 3,
+  "sync_interval": $INTERVAL
 }
 EOF
 
-# ENV
-export GIT_USER=$(echo $REPO | cut -d'/' -f1)
-export GIT_REPO=$(echo $REPO | cut -d'/' -f2)
-export XUI_TOKEN="$TOKEN"
+# -------------------------
+# SYSTEMD SYNC SERVICE (DAEMON)
+# -------------------------
 
-# SYSTEMD SYNC
 cat > /etc/systemd/system/xui-subsync.service <<EOF
 [Unit]
-Description=XUI Sync
+Description=XUI Subscription Sync
 After=network.target
 
 [Service]
 WorkingDirectory=/opt/xui-subsync
-Environment=XUI_TOKEN=$TOKEN
-Environment=GIT_USER=$GIT_USER
-Environment=GIT_REPO=$GIT_REPO
-ExecStart=/opt/xui-subsync/venv/bin/python update.py daemon --interval 21600
-Restart=always
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# WEB UI
-cat > /etc/systemd/system/xui-webui.service <<EOF
-[Unit]
-Description=XUI WebUI
-After=network.target
-
-[Service]
-WorkingDirectory=/opt/xui-subsync
-Environment=PORT=2086
-ExecStart=/opt/xui-subsync/venv/bin/python webui.py
+ExecStart=/opt/xui-subsync/venv/bin/python /opt/xui-subsync/update.py daemon --interval $INTERVAL
 Restart=always
 User=root
 
@@ -79,27 +84,42 @@ EOF
 
 systemctl daemon-reload
 systemctl enable xui-subsync
-systemctl enable xui-webui
-systemctl start xui-subsync
-systemctl start xui-webui
 
-# NGINX
-if [ ! -z "$DOMAIN" ]; then
-cat > /etc/nginx/sites-available/xui <<EOF
-server {
-    listen 80;
-    server_name $DOMAIN;
+# -------------------------
+# WEB UI SERVICE (OPTIONAL)
+# -------------------------
 
-    location / {
-        proxy_pass http://127.0.0.1:2086;
-    }
-}
+if [ "$ENABLE_UI" = "y" ]; then
+
+cat > /etc/systemd/system/xui-webui.service <<EOF
+[Unit]
+Description=XUI Web UI
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/xui-subsync
+Environment=PORT=$UI_PORT
+ExecStart=/opt/xui-subsync/venv/bin/python /opt/xui-subsync/webui.py
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
 EOF
 
-ln -sf /etc/nginx/sites-available/xui /etc/nginx/sites-enabled/
-systemctl restart nginx
+systemctl daemon-reload
+systemctl enable xui-webui
+systemctl start xui-webui
 
-certbot --nginx -d $DOMAIN --non-interactive --agree-tos -m admin@$DOMAIN || true
 fi
 
-echo "DONE"
+echo "===================================="
+echo " INSTALL COMPLETE"
+echo "===================================="
+
+echo "Start sync:"
+echo "systemctl start xui-subsync"
+
+if [ "$ENABLE_UI" = "y" ]; then
+    echo "Web UI: http://SERVER_IP:$UI_PORT"
+fi
