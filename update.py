@@ -654,7 +654,7 @@ def interactive_menu():
 
         print()
         print(bold("╔" + "═" * W + "╗"))
-        print(bold("║") + f"  {cyan('gitsub')} — XUI Subscription Sync" + " " * (W - 29) + bold("║"))
+        print(bold("║") + f"  {cyan('gitsub')} — XUI Subscription Sync" + " " * (W - 31) + bold("║"))
         print(bold("╠" + "═" * W + "╣"))
         print(sync_line)
         print(ui_line)
