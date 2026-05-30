@@ -27,21 +27,6 @@ A production-ready automation system for **3x-ui v3.2** that generates GitHub-ho
 
 ---
 
-## 📦 Project Structure
-
-
-/opt/xui-subsync
-├── update.py
-├── config.json
-├── submap.json
-├── subs/
-├── logs/
-├── venv/
-└── install.sh
-
-
----
-
 ## ⚙️ Installation
 
 ### 🟢 Automatic Installation (Recommended)
