@@ -455,6 +455,156 @@ def edit_settings():
 # INTERACTIVE MENU
 # ─────────────────────────────────────────
 
+# ─────────────────────────────────────────
+# SELF UPDATE
+# ─────────────────────────────────────────
+
+GITHUB_RAW = "https://raw.githubusercontent.com/diginetizen/mewobey-sub/main"
+UPDATE_FILES = ["update.py", "webui.py", "requirements.txt"]
+
+# Files that contain user config and must never be overwritten
+PROTECTED_FILES = {"config.json", "submap.json"}
+
+def check_for_updates() -> dict:
+    """Check GitHub for a newer version. Returns dict with info."""
+    try:
+        r = requests.get(f"{GITHUB_RAW}/version.txt", timeout=10)
+        if r.status_code == 200:
+            remote_ver = r.text.strip()
+        else:
+            # No version file — check commit hash via GitHub API
+            cfg = Config()
+            api = f"https://api.github.com/repos/diginetizen/mewobey-sub/commits/main"
+            r2 = requests.get(api, timeout=10)
+            if r2.status_code == 200:
+                remote_ver = r2.json()["sha"][:8]
+            else:
+                return {"available": False, "error": "Could not reach GitHub"}
+        # Read local version if it exists
+        local_ver_file = BASE_DIR / "version.txt"
+        local_ver = local_ver_file.read_text().strip() if local_ver_file.exists() else "unknown"
+        return {
+            "available": remote_ver != local_ver,
+            "local":     local_ver,
+            "remote":    remote_ver,
+        }
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+
+
+def do_self_update() -> bool:
+    """
+    Pull latest files from GitHub into the install dir.
+    Returns True if files changed and services need restart.
+    """
+    changed = []
+    errors  = []
+
+    for fname in UPDATE_FILES:
+        url = f"{GITHUB_RAW}/{fname}"
+        dest = BASE_DIR / fname
+        try:
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+            new_content = r.text
+
+            # Compare to existing
+            old_content = dest.read_text() if dest.exists() else None
+            if old_content == new_content:
+                log.info(f"Up to date: {fname}")
+                continue
+
+            # Backup current file
+            if dest.exists():
+                dest.rename(str(dest) + ".bak")
+
+            dest.write_text(new_content)
+            changed.append(fname)
+            log.info(f"Updated: {fname}")
+        except Exception as e:
+            errors.append(f"{fname}: {e}")
+            log.error(f"Failed to update {fname}: {e}")
+
+    # Update version marker
+    try:
+        r = requests.get(f"{GITHUB_RAW}/version.txt", timeout=10)
+        if r.status_code == 200:
+            (BASE_DIR / "version.txt").write_text(r.text.strip())
+        else:
+            api = "https://api.github.com/repos/diginetizen/mewobey-sub/commits/main"
+            r2 = requests.get(api, timeout=10)
+            if r2.status_code == 200:
+                (BASE_DIR / "version.txt").write_text(r2.json()["sha"][:8])
+    except Exception:
+        pass
+
+    # Update pip dependencies if requirements changed
+    if "requirements.txt" in changed:
+        try:
+            venv_pip = BASE_DIR / "venv" / "bin" / "pip"
+            if venv_pip.exists():
+                subprocess.run(
+                    [str(venv_pip), "install", "--quiet", "-r", str(BASE_DIR / "requirements.txt")],
+                    check=True
+                )
+                log.info("pip dependencies updated")
+        except Exception as e:
+            log.warning(f"pip update failed: {e}")
+
+    needs_restart = bool(changed)
+
+    if errors:
+        print(red(f"\n  Errors: {'; '.join(errors)}"))
+
+    return needs_restart, changed
+
+
+def self_update_interactive():
+    """Interactive update flow for the menu."""
+    print(f"\n  {bold('Checking for updates...')}")
+    info = check_for_updates()
+
+    if "error" in info and not info.get("available"):
+        print(yellow(f"\n  Could not check: {info['error']}"))
+        return
+
+    local  = info.get("local", "unknown")
+    remote = info.get("remote", "?")
+
+    if not info.get("available"):
+        print(green(f"\n  Already up to date  (version: {local})"))
+        return
+
+    print(f"\n  {yellow('Update available!')}")
+    print(f"  Current : {dim(local)}")
+    print(f"  Latest  : {cyan(remote)}")
+    print()
+    confirm = input("  Download and install update now? [y/n]: ").strip().lower()
+    if confirm != "y":
+        print("  Cancelled.")
+        return
+
+    print(f"\n  Downloading...")
+    needs_restart, changed = do_self_update()
+
+    if not changed:
+        print(green("\n  Nothing changed — already up to date."))
+        return
+
+    print(green(f"\n  Updated {len(changed)} file(s): {', '.join(changed)}"))
+
+    if needs_restart:
+        print(f"\n  {yellow('Services need to restart to apply the update.')}")
+        print(f"  {cyan('1')}  Restart now (recommended)")
+        print(f"  {cyan('0')}  Skip — I'll restart manually")
+        sub = input("\n  Choose: ").strip()
+        if sub == "1":
+            subprocess.run(["systemctl", "restart", "xui-subsync", "xui-webui"], check=False)
+            print(green("  Services restarted."))
+        else:
+            print(dim("  Run: systemctl restart xui-subsync xui-webui"))
+
+
 def interactive_menu():
     # Box width in visible chars (not counting ANSI codes)
     W = 44  # inner width between ║ borders including spaces
@@ -519,15 +669,20 @@ def interactive_menu():
         print(mrow("7", "Settings — view & change"))
         print(mrow("8", "Restart services"))
         print(mrow("9", "Service status details"))
+        print(mrow("u", "Check for updates"))
         print(mrow("0", "Exit"))
         print(blank())
         print(bold("╚" + "═" * W + "╝"))
         print()
 
-        choice = input("  Choose [0-9]: ").strip()
+        choice = input("  Choose [0-9 / u]: ").strip().lower()
 
         if choice == "0":
             break
+
+        elif choice == "u":
+            self_update_interactive()
+            input("\n  Press ENTER to continue...")
 
         elif choice == "1":
             print()
@@ -665,6 +820,21 @@ if __name__ == "__main__":
     # No args → interactive menu
     if not args:
         interactive_menu()
+
+    elif args[0] == "update":
+        info = check_for_updates()
+        if "error" in info and not info.get("available"):
+            print(yellow(f"Could not check for updates: {info['error']}"))
+            sys.exit(1)
+        if not info.get("available"):
+            print(green(f"Already up to date ({info.get('local', 'unknown')})"))
+            sys.exit(0)
+        print(f"Update available: {info.get('local')} → {info.get('remote')}")
+        needs_restart, changed = do_self_update()
+        print(f"Updated: {', '.join(changed) if changed else 'nothing changed'}")
+        if needs_restart:
+            subprocess.run(["systemctl", "restart", "xui-subsync", "xui-webui"], check=False)
+            print("Services restarted.")
 
     elif args[0] == "sync":
         Engine().sync()
