@@ -2,30 +2,23 @@
 
 set -e
 
-echo "===================================="
-echo "  XUI SUBSYNC AUTO INSTALLER v2"
-echo "===================================="
+echo "====================================="
+echo " XUI SUBSYNC INSTALLER v3 (HTTPS ONLY)"
+echo "====================================="
 
 # -------------------------
-# INPUT SECTION (SAFE DEFAULTS)
+# INPUTS
 # -------------------------
 
 read -p "Panel URL: " PANEL_URL
 read -p "API Token: " API_TOKEN
 
-echo ""
-echo "GitHub setup:"
-echo "1) user/repo (recommended)"
-echo "2) full https URL"
-read -p "Choose (1/2): " GIT_MODE
+read -p "GitHub username: " GITHUB_USER
+read -p "GitHub repo name: " GITHUB_REPO
 
-if [ "$GIT_MODE" = "1" ]; then
-    read -p "GitHub repo (e.g. diginetizen/mewobey-sub): " GITHUB_REPO
-    GITHUB_URL=""
-else
-    read -p "GitHub full URL: " GITHUB_URL
-    GITHUB_REPO=""
-fi
+echo ""
+echo "We use HTTPS token authentication (NO SSH required)"
+read -p "GitHub Personal Access Token (optional test push): " GITHUB_TOKEN
 
 read -p "Enable Web UI? (y/n): " ENABLE_UI
 read -p "Web UI Port (default 2086): " UI_PORT
@@ -35,7 +28,7 @@ read -p "Sync interval seconds (default 21600 = 6h): " INTERVAL
 INTERVAL=${INTERVAL:-21600}
 
 # -------------------------
-# INSTALL DEPENDENCIES
+# INSTALL PACKAGES
 # -------------------------
 
 apt update
@@ -46,25 +39,24 @@ source venv/bin/activate
 pip install requests flask
 
 # -------------------------
-# CONFIG BUILD
+# CONFIG FILE
 # -------------------------
 
 cat > config.json <<EOF
 {
   "panel_url": "$PANEL_URL",
   "api_token": "$API_TOKEN",
+  "github_user": "$GITHUB_USER",
   "github_repo": "$GITHUB_REPO",
-  "github_repo_url": "$GITHUB_URL",
+  "github_token": "$GITHUB_TOKEN",
   "github_branch": "main",
   "filename_length": 32,
-  "request_timeout": 20,
-  "request_retries": 3,
   "sync_interval": $INTERVAL
 }
 EOF
 
 # -------------------------
-# SYSTEMD SYNC SERVICE (DAEMON)
+# SYNC SERVICE
 # -------------------------
 
 cat > /etc/systemd/system/xui-subsync.service <<EOF
@@ -86,7 +78,7 @@ systemctl daemon-reload
 systemctl enable xui-subsync
 
 # -------------------------
-# WEB UI SERVICE (OPTIONAL)
+# WEB UI SERVICE
 # -------------------------
 
 if [ "$ENABLE_UI" = "y" ]; then
@@ -113,12 +105,14 @@ systemctl start xui-webui
 
 fi
 
-echo "===================================="
-echo " INSTALL COMPLETE"
-echo "===================================="
+# -------------------------
+# DONE
+# -------------------------
 
-echo "Start sync:"
-echo "systemctl start xui-subsync"
+echo "====================================="
+echo " INSTALL COMPLETE"
+echo "====================================="
+echo "Start sync: systemctl start xui-subsync"
 
 if [ "$ENABLE_UI" = "y" ]; then
     echo "Web UI: http://SERVER_IP:$UI_PORT"
