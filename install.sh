@@ -28,7 +28,12 @@ echo ""
 # 1. Panel
 # ─────────────────────────────────────────
 echo -e "${YELLOW}── 3x-ui Panel ───────────────────────────${RESET}"
-read -rp "  Panel URL (e.g. https://panel.example.com): " PANEL_URL
+echo "  Enter your 3x-ui panel's base URL including port."
+echo "  This is the URL you open in a browser to reach the panel."
+echo "  Example: https://panel.example.com:2053"
+echo "           http://1.2.3.4:54321"
+echo ""
+read -rp "  Panel API base URL: " PANEL_API_URL
 read -rp "  API Bearer Token: " API_TOKEN
 echo ""
 
@@ -69,10 +74,32 @@ if [ "$DEPLOY_CHOICE" = "2" ]; then
     HAS_KEY="${HAS_KEY:-2}"
 
     if [ "$HAS_KEY" = "1" ]; then
-        read -rp "  Path to private key (default: /root/.ssh/id_rsa): " SSH_KEY_PATH
-        SSH_KEY_PATH="${SSH_KEY_PATH:-/root/.ssh/id_rsa}"
-        [ ! -f "$SSH_KEY_PATH" ] && error "Key not found at $SSH_KEY_PATH"
-        success "Using existing key: $SSH_KEY_PATH"
+        echo "  How do you want to provide your existing key?"
+        echo "  [1] Give the file path  (e.g. /root/.ssh/id_rsa)"
+        echo "  [2] Paste the private key content now"
+        echo ""
+        read -rp "  Choose [1/2] (default: 1): " KEY_INPUT_METHOD
+        KEY_INPUT_METHOD="${KEY_INPUT_METHOD:-1}"
+
+        if [ "$KEY_INPUT_METHOD" = "2" ]; then
+            info "Paste your private key below. Press Ctrl+D on an empty line when done."
+            echo ""
+            mkdir -p /root/.ssh && chmod 700 /root/.ssh
+            cat > "$SSH_KEY_PATH" << 'KEYEOF'
+KEYEOF
+            # Actually read pasted content
+            cat > "$SSH_KEY_PATH"
+            chmod 600 "$SSH_KEY_PATH"
+            # Derive public key from private key
+            ssh-keygen -y -f "$SSH_KEY_PATH" > "$SSH_KEY_PATH.pub" 2>/dev/null || true
+            success "Key stored at $SSH_KEY_PATH"
+        else
+            read -rp "  Path to private key (default: /root/.ssh/id_rsa): " SSH_KEY_PATH
+            SSH_KEY_PATH="${SSH_KEY_PATH:-/root/.ssh/id_rsa}"
+            [ ! -f "$SSH_KEY_PATH" ] && error "Key not found at $SSH_KEY_PATH"
+            chmod 600 "$SSH_KEY_PATH"
+            success "Using existing key: $SSH_KEY_PATH"
+        fi
     else
         info "Generating new ED25519 deploy key at $SSH_KEY_PATH ..."
         mkdir -p /root/.ssh && chmod 700 /root/.ssh
@@ -204,7 +231,7 @@ esac
 
 echo ""
 info "Summary:"
-echo "   Panel URL   : $PANEL_URL"
+echo "   Panel API URL : $PANEL_API_URL"
 echo "   GitHub repo : $GITHUB_USER/$GITHUB_REPO ($GITHUB_BRANCH)"
 echo "   Deploy via  : $DEPLOY_METHOD"
 echo "   Web UI      : $ENABLE_UI (port $UI_PORT)"
@@ -256,12 +283,14 @@ info "Configuring git..."
 # Use GitHub username as git identity — no need to ask user separately
 git config --global user.email "${GITHUB_USER}@users.noreply.github.com"
 git config --global user.name "$GITHUB_USER"
+# Suppress branch name warning — always use the branch the user specified
+git config --global init.defaultBranch "$GITHUB_BRANCH"
 
 cd "$INSTALL_DIR"
 
 if [ ! -d .git ]; then
-    git init
-    git branch -M "$GITHUB_BRANCH"
+    git init -q
+    git branch -M "$GITHUB_BRANCH" 2>/dev/null || true
 fi
 
 # Set remote URL
@@ -274,14 +303,46 @@ fi
 git remote remove origin 2>/dev/null || true
 git remote add origin "$REMOTE_URL"
 
-# .gitignore — keep secrets and runtime files out of repo
+# .gitignore — keep secrets, runtime files, and OS junk out of repo
 cat > .gitignore <<'GITIGNORE'
+# gitsub secrets & runtime — NEVER push these
 config.json
 submap.json
+
+# Python
 venv/
-logs/
+.venv/
 *.pyc
+*.pyo
+*.pyd
 __pycache__/
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.env
+.env.*
 GITIGNORE
 
 # Try to sync with remote
@@ -310,7 +371,7 @@ success "Git configured"
 info "Writing config.json..."
 cat > "$INSTALL_DIR/config.json" <<EOF
 {
-  "panel_url":      "$PANEL_URL",
+  "panel_api_url":  "$PANEL_API_URL",
   "api_token":      "$API_TOKEN",
 
   "github_user":    "$GITHUB_USER",
@@ -421,11 +482,15 @@ server {
     server_name $DOMAIN;
 
     location / {
-        proxy_pass         http://127.0.0.1:$UI_PORT;
-        proxy_set_header   Host \$host;
-        proxy_set_header   X-Real-IP \$remote_addr;
-        proxy_set_header   X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_read_timeout 60;
+        proxy_pass             http://127.0.0.1:$UI_PORT;
+        proxy_set_header       Host \$host;
+        proxy_set_header       X-Real-IP \$remote_addr;
+        proxy_set_header       X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header       X-Forwarded-Proto \$scheme;
+        proxy_read_timeout     60;
+        proxy_http_version     1.1;
+        proxy_set_header       Upgrade \$http_upgrade;
+        proxy_set_header       Connection keep-alive;
     }
 }
 EOF
