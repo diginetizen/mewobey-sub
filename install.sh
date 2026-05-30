@@ -85,12 +85,8 @@ if [ "$DEPLOY_CHOICE" = "2" ]; then
             info "Paste your private key below. Press Ctrl+D on an empty line when done."
             echo ""
             mkdir -p /root/.ssh && chmod 700 /root/.ssh
-            cat > "$SSH_KEY_PATH" << 'KEYEOF'
-KEYEOF
-            # Actually read pasted content
             cat > "$SSH_KEY_PATH"
             chmod 600 "$SSH_KEY_PATH"
-            # Derive public key from private key
             ssh-keygen -y -f "$SSH_KEY_PATH" > "$SSH_KEY_PATH.pub" 2>/dev/null || true
             success "Key stored at $SSH_KEY_PATH"
         else
@@ -100,23 +96,22 @@ KEYEOF
             chmod 600 "$SSH_KEY_PATH"
             success "Using existing key: $SSH_KEY_PATH"
         fi
+        SHOW_PUBKEY="n"
     else
         info "Generating new ED25519 deploy key at $SSH_KEY_PATH ..."
         mkdir -p /root/.ssh && chmod 700 /root/.ssh
-        # Remove old key if exists to avoid prompt
         rm -f "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub"
         ssh-keygen -t ed25519 -C "gitsub-deploy@$(hostname)" -f "$SSH_KEY_PATH" -N ""
         success "Key generated: $SSH_KEY_PATH"
+        SHOW_PUBKEY="y"
     fi
 
     # Write SSH config so git uses this specific key for github.com
     SSH_CONFIG="/root/.ssh/config"
     mkdir -p /root/.ssh && chmod 700 /root/.ssh
 
-    # Remove old gitsub block if present
     if grep -q "Host github-gitsub" "$SSH_CONFIG" 2>/dev/null; then
-        # Remove the old block (4 lines)
-        sed -i '/Host github-gitsub/,+4d' "$SSH_CONFIG"
+        sed -i '/Host github-gitsub/,+5d' "$SSH_CONFIG"
     fi
 
     cat >> "$SSH_CONFIG" <<SSHEOF
@@ -131,26 +126,28 @@ SSHEOF
     chmod 600 "$SSH_CONFIG"
     success "SSH config written: $SSH_CONFIG"
 
-    # Show the public key and link
-    echo ""
-    echo -e "${YELLOW}╔══ ACTION REQUIRED ═══════════════════════════════════╗${RESET}"
-    echo -e "${YELLOW}║  Add this public key to your GitHub repo              ║${RESET}"
-    echo -e "${YELLOW}║  → Settings → Deploy keys → Add deploy key            ║${RESET}"
-    echo -e "${YELLOW}║  → Check: Allow write access                          ║${RESET}"
-    echo -e "${YELLOW}╚══════════════════════════════════════════════════════╝${RESET}"
-    echo ""
-    echo -e "${CYAN}  Public key to paste:${RESET}"
-    echo "  ┌─────────────────────────────────────────────────────"
-    cat "$SSH_KEY_PATH.pub" | sed 's/^/  │ /'
-    echo "  └─────────────────────────────────────────────────────"
-    echo ""
-    echo -e "  ${CYAN}Click here to add it:${RESET}"
-    echo -e "  https://github.com/$GITHUB_USER/$GITHUB_REPO/settings/keys/new"
-    echo ""
-    read -rp "  Press ENTER after you've added the key to GitHub and enabled write access..."
+    # Only show deploy key instructions for newly generated keys
+    if [ "$SHOW_PUBKEY" = "y" ]; then
+        echo ""
+        echo -e "${YELLOW}╔══ ACTION REQUIRED ═══════════════════════════════════╗${RESET}"
+        echo -e "${YELLOW}║  Add this public key to your GitHub repo              ║${RESET}"
+        echo -e "${YELLOW}║  → Settings → Deploy keys → Add deploy key            ║${RESET}"
+        echo -e "${YELLOW}║  → Check: Allow write access                          ║${RESET}"
+        echo -e "${YELLOW}╚══════════════════════════════════════════════════════╝${RESET}"
+        echo ""
+        echo -e "${CYAN}  Public key to paste:${RESET}"
+        echo "  ┌─────────────────────────────────────────────────────"
+        cat "$SSH_KEY_PATH.pub" | sed 's/^/  │ /'
+        echo "  └─────────────────────────────────────────────────────"
+        echo ""
+        echo -e "  ${CYAN}Click here to add it:${RESET}"
+        echo -e "  https://github.com/$GITHUB_USER/$GITHUB_REPO/settings/keys/new"
+        echo ""
+        read -rp "  Press ENTER after you've added the key to GitHub and enabled write access..."
+    fi
 
-    # Test SSH using the alias (this is what git will use)
-    info "Testing SSH connection via github-gitsub alias..."
+    # Test SSH connection
+    info "Testing SSH connection to GitHub..."
     set +e
     SSH_TEST=$(ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no -T git@github.com 2>&1)
     SSH_OK=$?
@@ -158,8 +155,8 @@ SSHEOF
     if echo "$SSH_TEST" | grep -q "successfully authenticated"; then
         success "SSH connection to GitHub: OK"
     else
-        warn "SSH test output: $SSH_TEST"
-        warn "Could not confirm SSH. Make sure you added the key with write access, then continue."
+        warn "SSH test: $SSH_TEST"
+        warn "If this fails, ensure the key has write access on GitHub."
         read -rp "  Press ENTER to continue anyway, or Ctrl+C to abort..."
     fi
 
@@ -476,6 +473,23 @@ success "Systemd services started"
 # ─────────────────────────────────────────
 if [ "$ENABLE_NGINX" = "y" ] && [ -n "$DOMAIN" ]; then
     info "Configuring Nginx for $DOMAIN ..."
+
+    # Check for conflicting nginx configs that already use this domain name
+    # This is what causes: "conflicting server name" warnings
+    CONFLICT_FILES=$(grep -rl "server_name.*$DOMAIN" /etc/nginx/sites-enabled/ 2>/dev/null | grep -v "xui-webui" || true)
+    if [ -n "$CONFLICT_FILES" ]; then
+        warn "Found existing nginx config(s) with server_name '$DOMAIN':"
+        echo "$CONFLICT_FILES" | while read -r f; do warn "  $f"; done
+        echo ""
+        read -rp "  Remove conflicting config(s) to avoid warning? [y/n] (default: y): " REMOVE_CONFLICT
+        REMOVE_CONFLICT="${REMOVE_CONFLICT:-y}"
+        if [ "$REMOVE_CONFLICT" = "y" ]; then
+            echo "$CONFLICT_FILES" | while read -r f; do
+                rm -f "$f"
+                info "Removed: $f"
+            done
+        fi
+    fi
     cat > "$NGINX_CONF" <<EOF
 server {
     listen 80;
