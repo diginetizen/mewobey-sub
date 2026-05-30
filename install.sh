@@ -2,56 +2,74 @@
 
 set -e
 
-echo "====================================="
-echo " XUI SUB SYNC FULL INSTALLER"
-echo "====================================="
+echo "INSTALL XUI SYSTEM"
 
-read -p "GitHub repo (diginetizen/mewobey-sub): " GITHUB_REPO
-read -p "Panel URL: " PANEL_URL
-read -p "API Token: " API_TOKEN
-
-read -p "Enable Web UI? (y/n): " ENABLE_UI
-read -p "Web UI Port (default 2086): " UI_PORT
-UI_PORT=${UI_PORT:-2086}
-
+read -p "GitHub user/repo (e.g. name/repo): " REPO
+read -p "Panel URL: " PANEL
+read -p "API Token: " TOKEN
 read -p "Domain (optional): " DOMAIN
 
-echo "[1/6] Installing system packages..."
 apt update
-apt install -y python3 python3-venv git nginx
+apt install -y git python3 python3-venv nginx certbot python3-certbot-nginx
 
-echo "[2/6] Python setup..."
+# SSH
+ssh-keygen -t rsa -b 4096 -N "" -f ~/.ssh/id_rsa || true
+
+echo "ADD THIS TO GITHUB:"
+cat ~/.ssh/id_rsa.pub
+read -p "Press ENTER after adding SSH key"
+
+# clone
+rm -rf /opt/xui-subsync
+git clone git@github.com:$REPO.git /opt/xui-subsync
+
+cd /opt/xui-subsync
+
 python3 -m venv venv
 source venv/bin/activate
 pip install requests flask
 
-echo "[3/6] Config file..."
 cat > config.json <<EOF
 {
-  "panel_url": "$PANEL_URL",
-  "api_token": "$API_TOKEN",
-  "github_username": "diginetizen",
-  "github_repository": "$(echo $GITHUB_REPO | cut -d'/' -f2)",
-  "github_branch": "main",
-  "filename_length": 32,
-  "request_timeout": 20,
-  "request_retries": 3
+  "panel_url": "$PANEL",
+  "filename_length": 32
 }
 EOF
 
-echo "[4/6] Creating Web UI service..."
+# ENV
+export GIT_USER=$(echo $REPO | cut -d'/' -f1)
+export GIT_REPO=$(echo $REPO | cut -d'/' -f2)
+export XUI_TOKEN="$TOKEN"
 
-if [ "$ENABLE_UI" = "y" ]; then
-
-cat > /etc/systemd/system/xui-webui.service <<EOF
+# SYSTEMD SYNC
+cat > /etc/systemd/system/xui-subsync.service <<EOF
 [Unit]
-Description=XUI Web UI
+Description=XUI Sync
 After=network.target
 
 [Service]
 WorkingDirectory=/opt/xui-subsync
-Environment=PORT=$UI_PORT
-ExecStart=/opt/xui-subsync/venv/bin/python /opt/xui-subsync/webui.py
+Environment=XUI_TOKEN=$TOKEN
+Environment=GIT_USER=$GIT_USER
+Environment=GIT_REPO=$GIT_REPO
+ExecStart=/opt/xui-subsync/venv/bin/python update.py daemon --interval 21600
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# WEB UI
+cat > /etc/systemd/system/xui-webui.service <<EOF
+[Unit]
+Description=XUI WebUI
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/xui-subsync
+Environment=PORT=2086
+ExecStart=/opt/xui-subsync/venv/bin/python webui.py
 Restart=always
 User=root
 
@@ -60,37 +78,28 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
+systemctl enable xui-subsync
 systemctl enable xui-webui
+systemctl start xui-subsync
 systemctl start xui-webui
 
-fi
-
-echo "[5/6] Creating nginx (if domain provided)..."
-
+# NGINX
 if [ ! -z "$DOMAIN" ]; then
-
-cat > /etc/nginx/sites-available/xui-webui <<EOF
+cat > /etc/nginx/sites-available/xui <<EOF
 server {
     listen 80;
     server_name $DOMAIN;
 
     location / {
-        proxy_pass http://127.0.0.1:$UI_PORT;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_pass http://127.0.0.1:2086;
     }
 }
 EOF
 
-ln -sf /etc/nginx/sites-available/xui-webui /etc/nginx/sites-enabled/
+ln -sf /etc/nginx/sites-available/xui /etc/nginx/sites-enabled/
 systemctl restart nginx
 
+certbot --nginx -d $DOMAIN --non-interactive --agree-tos -m admin@$DOMAIN || true
 fi
 
-echo "[6/6] Done!"
-
-echo "Start sync:"
-echo "python update.py sync"
-
-echo "Start web:"
-echo "systemctl start xui-webui"
+echo "DONE"
