@@ -23,6 +23,7 @@ class Config:
 
         self.github_user = d["github_user"]
         self.github_repo = d["github_repo"]
+        self.github_token = d["github_token"]
         self.github_branch = d.get("github_branch", "main")
 
         self.filename_length = d.get("filename_length", 32)
@@ -48,7 +49,7 @@ def hash_links(links):
 
 
 # =========================
-# API CLIENT
+# API
 # =========================
 
 class API:
@@ -60,30 +61,13 @@ class API:
 
     def get_clients(self):
         url = f"{self.c.panel_url}/panel/api/clients/list"
-
-        for _ in range(self.c.retries):
-            try:
-                r = requests.get(url, headers=self.headers(), timeout=self.c.timeout)
-                data = r.json()
-                if data.get("success"):
-                    return data.get("obj", [])
-            except:
-                time.sleep(1)
-
-        return []
+        r = requests.get(url, headers=self.headers(), timeout=self.c.timeout)
+        return r.json().get("obj", [])
 
     def get_sub(self, sub_id):
         url = f"{self.c.panel_url}/panel/api/clients/subLinks/{sub_id}"
-
-        try:
-            r = requests.get(url, headers=self.headers(), timeout=self.c.timeout)
-            data = r.json()
-            if data.get("success"):
-                return data.get("obj", [])
-        except:
-            pass
-
-        return []
+        r = requests.get(url, headers=self.headers(), timeout=self.c.timeout)
+        return r.json().get("obj", [])
 
 
 # =========================
@@ -98,8 +82,7 @@ class Store:
         os.makedirs(self.sub_dir, exist_ok=True)
 
         if not os.path.exists(self.map_file):
-            with open(self.map_file, "w") as f:
-                json.dump({}, f)
+            json.dump({}, open(self.map_file, "w"))
 
     def load(self):
         return json.load(open(self.map_file))
@@ -107,37 +90,36 @@ class Store:
     def save(self, data):
         json.dump(data, open(self.map_file, "w"), indent=2)
 
-    def write_file(self, filename, links):
-        with open(f"{self.sub_dir}/{filename}", "w") as f:
-            f.write("\n".join(links))
+    def write_file(self, name, links):
+        open(f"{self.sub_dir}/{name}", "w").write("\n".join(links))
 
-    def delete_file(self, filename):
+    def delete_file(self, name):
         try:
-            os.remove(f"{self.sub_dir}/{filename}")
+            os.remove(f"{self.sub_dir}/{name}")
         except:
             pass
 
 
 # =========================
-# GIT (SSH ONLY)
+# GIT (HTTPS TOKEN)
 # =========================
 
 class Git:
     def __init__(self, c: Config):
         self.c = c
 
-    def commit(self, msg):
+    def push(self):
         subprocess.call(["git", "add", "."])
 
         status = subprocess.getoutput("git status --porcelain")
         if not status.strip():
             return
 
-        subprocess.call(["git", "commit", "-m", msg])
+        subprocess.call(["git", "commit", "-m", "auto sync"])
 
-        repo_url = f"git@github.com:{self.c.github_user}/{self.c.github_repo}.git"
+        url = f"https://{self.c.github_token}@github.com/{self.c.github_user}/{self.c.github_repo}.git"
 
-        subprocess.call(["git", "push", "origin", self.c.github_branch])
+        subprocess.call(["git", "push", url, self.c.github_branch])
 
 
 # =========================
@@ -150,7 +132,6 @@ class Engine:
         self.api = API(self.c)
         self.store = Store()
         self.git = Git(self.c)
-
         self.map = self.store.load()
 
     def sync(self):
@@ -160,8 +141,8 @@ class Engine:
         new_map = {}
 
         for c in clients:
-            email = c.get("email")
             sub_id = c.get("subId")
+            email = c.get("email")
 
             if not sub_id:
                 continue
@@ -196,7 +177,7 @@ class Engine:
                 "updated": int(time.time())
             }
 
-        # remove deleted users
+        # delete removed users
         for k in list(self.map.keys()):
             if k not in seen:
                 self.store.delete_file(self.map[k]["filename"])
@@ -204,8 +185,7 @@ class Engine:
         self.map = new_map
         self.store.save(self.map)
 
-        self.git.commit("auto sync subscriptions")
-
+        self.git.push()
         print("SYNC DONE")
 
 
@@ -214,8 +194,6 @@ class Engine:
 # =========================
 
 def daemon(interval):
-    print(f"Daemon running... interval={interval}s")
-
     while True:
         try:
             Engine().sync()
@@ -223,21 +201,6 @@ def daemon(interval):
             print("ERROR:", e)
 
         time.sleep(interval)
-
-
-# =========================
-# LOOKUP
-# =========================
-
-def lookup(query):
-    data = json.load(open("submap.json"))
-
-    for sub_id, info in data.items():
-        if query == sub_id or query == info.get("email"):
-            print(json.dumps(info, indent=2))
-            return
-
-    print("NOT FOUND")
 
 
 # =========================
@@ -255,12 +218,3 @@ if __name__ == "__main__":
     elif sys.argv[1] == "daemon":
         interval = int(sys.argv[3]) if len(sys.argv) > 3 else 21600
         daemon(interval)
-
-    elif sys.argv[1] == "lookup":
-        lookup(sys.argv[2])
-
-    else:
-        print("Commands:")
-        print("  sync")
-        print("  daemon [interval]")
-        print("  lookup <email|subId>")
