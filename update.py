@@ -1,638 +1,443 @@
 #!/usr/bin/env python3
 """
-gitsub WebUI — Subscription map dashboard
+gitsub - XUI Subscription Sync Engine
+Syncs 3x-ui client subscriptions to GitHub-hosted files.
 """
 
 import os
 import sys
 import json
+import time
+import hashlib
+import secrets
+import string
 import subprocess
-import threading
+import logging
+import requests
 from pathlib import Path
 from datetime import datetime
-from flask import Flask, jsonify, request, redirect
+
+# ─────────────────────────────────────────
+# PATHS
+# ─────────────────────────────────────────
 
 BASE_DIR = Path(__file__).resolve().parent
-SUBMAP_FILE = BASE_DIR / "submap.json"
 CONFIG_FILE = BASE_DIR / "config.json"
+SUBMAP_FILE = BASE_DIR / "submap.json"
+SUBS_DIR = BASE_DIR / "subs"
+LOG_DIR = BASE_DIR / "logs"
 
-app = Flask(__name__)
+# ─────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────
 
-PORT = int(os.getenv("PORT", 2086))
+LOG_DIR.mkdir(exist_ok=True)
+SUBS_DIR.mkdir(exist_ok=True)
+
+log = logging.getLogger("gitsub")
+log.setLevel(logging.DEBUG)
+
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+
+_fh = logging.FileHandler(LOG_DIR / "sync.log")
+_fh.setFormatter(_fmt)
+log.addHandler(_fh)
+
+_eh = logging.FileHandler(LOG_DIR / "error.log")
+_eh.setLevel(logging.ERROR)
+_eh.setFormatter(_fmt)
+log.addHandler(_eh)
+
+_sh = logging.StreamHandler()
+_sh.setFormatter(_fmt)
+log.addHandler(_sh)
 
 
 # ─────────────────────────────────────────
-# Helpers
+# CONFIG
 # ─────────────────────────────────────────
 
-def load_submap() -> dict:
-    if not SUBMAP_FILE.exists():
-        return {}
-    with open(SUBMAP_FILE) as f:
-        return json.load(f)
+class Config:
+    def __init__(self):
+        if not CONFIG_FILE.exists():
+            print("ERROR: config.json not found. Run install.sh first.")
+            sys.exit(1)
+
+        with open(CONFIG_FILE) as f:
+            d = json.load(f)
+
+        self.panel_url     = d["panel_url"].rstrip("/")
+        self.api_token     = d["api_token"]
+
+        self.github_user   = d["github_user"]
+        self.github_repo   = d["github_repo"]
+        self.github_branch = d.get("github_branch", "main")
+
+        # deploy method: "token" or "ssh"
+        self.deploy_method = d.get("deploy_method", "token")
+        self.github_token  = d.get("github_token", "")
+
+        self.filename_length = d.get("filename_length", 32)
+        self.sync_interval   = d.get("sync_interval", 21600)
+
+        self.timeout = 20
+        self.retries = 3
+
+    @property
+    def raw_base_url(self):
+        return f"https://raw.githubusercontent.com/{self.github_user}/{self.github_repo}/{self.github_branch}/subs"
 
 
-def load_config() -> dict:
-    if not CONFIG_FILE.exists():
-        return {}
-    with open(CONFIG_FILE) as f:
-        return json.load(f)
+# ─────────────────────────────────────────
+# UTILS
+# ─────────────────────────────────────────
+
+ALPHABET = string.ascii_letters + string.digits
 
 
-def format_ts(epoch):
-    if not epoch:
-        return "—"
-    try:
-        return datetime.utcfromtimestamp(int(epoch)).strftime("%Y-%m-%d %H:%M UTC")
-    except Exception:
-        return "—"
+def gen_filename(n: int) -> str:
+    return "".join(secrets.choice(ALPHABET) for _ in range(n)) + ".txt"
 
 
-_sync_running = False
-_sync_lock = threading.Lock()
+def hash_content(links: list) -> str:
+    return hashlib.sha256("\n".join(links).encode()).hexdigest()
 
 
-def trigger_sync():
-    global _sync_running
-    with _sync_lock:
-        if _sync_running:
-            return False
-        _sync_running = True
+# ─────────────────────────────────────────
+# API
+# ─────────────────────────────────────────
 
-    def _run():
-        global _sync_running
+class API:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def _headers(self):
+        return {"Authorization": f"Bearer {self.cfg.api_token}"}
+
+    def _get(self, url: str):
+        last_err = None
+        for attempt in range(1, self.cfg.retries + 1):
+            try:
+                r = requests.get(url, headers=self._headers(), timeout=self.cfg.timeout)
+                r.raise_for_status()
+                return r.json()
+            except Exception as e:
+                last_err = e
+                log.warning(f"Attempt {attempt} failed for {url}: {e}")
+                time.sleep(2 * attempt)
+        raise RuntimeError(f"All {self.cfg.retries} attempts failed: {last_err}")
+
+    def get_clients(self) -> list:
+        data = self._get(f"{self.cfg.panel_url}/panel/api/clients/list")
+        return data.get("obj", [])
+
+    def get_sub_links(self, sub_id: str) -> list:
+        data = self._get(f"{self.cfg.panel_url}/panel/api/clients/subLinks/{sub_id}")
+        return data.get("obj", [])
+
+
+# ─────────────────────────────────────────
+# STORE
+# ─────────────────────────────────────────
+
+class Store:
+    def load(self) -> dict:
+        if not SUBMAP_FILE.exists():
+            return {}
+        with open(SUBMAP_FILE) as f:
+            return json.load(f)
+
+    def save(self, data: dict):
+        with open(SUBMAP_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+
+    def write_sub(self, filename: str, links: list):
+        (SUBS_DIR / filename).write_text("\n".join(links))
+
+    def delete_sub(self, filename: str):
+        p = SUBS_DIR / filename
+        if p.exists():
+            p.unlink()
+            log.info(f"Deleted sub file: {filename}")
+
+
+# ─────────────────────────────────────────
+# GIT
+# ─────────────────────────────────────────
+
+class Git:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def _run(self, args: list, check=True) -> subprocess.CompletedProcess:
+        result = subprocess.run(args, cwd=BASE_DIR, capture_output=True, text=True)
+        if check and result.returncode != 0:
+            raise RuntimeError(f"git {args[1]} failed: {result.stderr.strip()}")
+        return result
+
+    def _remote_url(self) -> str:
+        if self.cfg.deploy_method == "ssh":
+            return f"git@github.com:{self.cfg.github_user}/{self.cfg.github_repo}.git"
+        else:
+            return f"https://{self.cfg.github_token}@github.com/{self.cfg.github_user}/{self.cfg.github_repo}.git"
+
+    def _ensure_remote(self):
+        """Make sure the remote is set correctly."""
+        result = self._run(["git", "remote", "get-url", "origin"], check=False)
+        url = self._remote_url()
+        if result.returncode != 0:
+            self._run(["git", "remote", "add", "origin", url])
+        else:
+            self._run(["git", "remote", "set-url", "origin", url])
+
+    def pull_rebase(self):
+        """Pull remote changes before pushing to avoid diverged history."""
         try:
-            subprocess.run(
-                [sys.executable, str(BASE_DIR / "update.py"), "sync"],
-                cwd=BASE_DIR
-            )
-        finally:
-            _sync_running = False
+            self._run(["git", "fetch", "origin", self.cfg.github_branch])
+            self._run(["git", "rebase", f"origin/{self.cfg.github_branch}"], check=False)
+            log.info("Git pull/rebase OK")
+        except Exception as e:
+            log.warning(f"Rebase skipped (may be new repo): {e}")
 
-    threading.Thread(target=_run, daemon=True).start()
-    return True
+    def push(self) -> bool:
+        """Stage, commit, and push all changes. Returns True if something was pushed."""
+        self._ensure_remote()
+
+        self._run(["git", "add", "subs/"])
+
+        status = self._run(["git", "status", "--porcelain"], check=False)
+        if not status.stdout.strip():
+            log.info("Nothing to push (no changes)")
+            return False
+
+        self.pull_rebase()
+
+        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        self._run(["git", "commit", "-m", f"auto sync {ts}"])
+
+        url = self._remote_url()
+        result = subprocess.run(
+            ["git", "push", url, self.cfg.github_branch],
+            cwd=BASE_DIR,
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Push failed: {result.stderr.strip()}")
+
+        log.info("Git push OK")
+        return True
 
 
 # ─────────────────────────────────────────
-# HTML (single-file, no templates dir needed)
+# ENGINE
 # ─────────────────────────────────────────
 
-HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>gitsub dashboard</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
-<style>
-  :root {
-    --bg:      #0d0f12;
-    --surface: #14171d;
-    --border:  #1e2330;
-    --accent:  #00d4aa;
-    --accent2: #007aff;
-    --warn:    #ff9f43;
-    --danger:  #ff4d6d;
-    --text:    #c8d0e0;
-    --muted:   #545e72;
-    --mono:    'IBM Plex Mono', monospace;
-    --sans:    'IBM Plex Sans', sans-serif;
-  }
+class Engine:
+    def __init__(self):
+        self.cfg   = Config()
+        self.api   = API(self.cfg)
+        self.store = Store()
+        self.git   = Git(self.cfg)
 
-  * { box-sizing: border-box; margin: 0; padding: 0; }
+    def sync(self):
+        log.info("─── Sync started ───")
+        submap = self.store.load()
+        clients = self.api.get_clients()
+        log.info(f"Found {len(clients)} clients from panel")
 
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: var(--sans);
-    font-size: 14px;
-    min-height: 100vh;
-  }
+        seen_ids = set()
+        new_map = {}
 
-  /* ── Header ── */
-  header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 18px 28px;
-    border-bottom: 1px solid var(--border);
-    background: var(--surface);
-    position: sticky;
-    top: 0;
-    z-index: 10;
-  }
+        for client in clients:
+            sub_id = client.get("subId", "").strip()
+            email  = client.get("email", "unknown")
 
-  .logo {
-    font-family: var(--mono);
-    font-size: 17px;
-    font-weight: 600;
-    color: var(--accent);
-    letter-spacing: -0.5px;
-  }
-  .logo span { color: var(--muted); font-weight: 400; }
+            if not sub_id:
+                continue
 
-  .header-actions { display: flex; gap: 10px; align-items: center; }
+            seen_ids.add(sub_id)
 
-  /* ── Buttons ── */
-  button {
-    font-family: var(--mono);
-    font-size: 12px;
-    font-weight: 500;
-    border: 1px solid var(--border);
-    background: transparent;
-    color: var(--text);
-    padding: 7px 16px;
-    cursor: pointer;
-    border-radius: 4px;
-    transition: all 0.15s;
-    letter-spacing: 0.3px;
-  }
-  button:hover { border-color: var(--accent); color: var(--accent); }
-  button.primary {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: #0d0f12;
-  }
-  button.primary:hover { opacity: 0.85; }
-  button:disabled { opacity: 0.4; cursor: not-allowed; }
+            try:
+                links = self.api.get_sub_links(sub_id)
+            except Exception as e:
+                log.error(f"Failed to fetch links for {email} ({sub_id}): {e}")
+                if sub_id in submap:
+                    new_map[sub_id] = submap[sub_id]
+                continue
 
-  /* ── Stats bar ── */
-  .stats {
-    display: flex;
-    gap: 1px;
-    background: var(--border);
-    border-bottom: 1px solid var(--border);
-  }
-  .stat {
-    flex: 1;
-    background: var(--surface);
-    padding: 14px 24px;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-  .stat-label {
-    font-family: var(--mono);
-    font-size: 10px;
-    color: var(--muted);
-    text-transform: uppercase;
-    letter-spacing: 1px;
-  }
-  .stat-value {
-    font-family: var(--mono);
-    font-size: 22px;
-    font-weight: 600;
-    color: var(--accent);
-  }
+            if not links:
+                log.warning(f"No links for {email} ({sub_id}), skipping")
+                continue
 
-  /* ── Search / filter bar ── */
-  .toolbar {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 14px 28px;
-    border-bottom: 1px solid var(--border);
-  }
-  .search-wrap {
-    flex: 1;
-    position: relative;
-  }
-  .search-wrap input {
-    width: 100%;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    color: var(--text);
-    font-family: var(--mono);
-    font-size: 13px;
-    padding: 8px 12px 8px 32px;
-    border-radius: 4px;
-    outline: none;
-    transition: border-color 0.15s;
-  }
-  .search-wrap input:focus { border-color: var(--accent); }
-  .search-icon {
-    position: absolute;
-    left: 10px;
-    top: 50%;
-    transform: translateY(-50%);
-    color: var(--muted);
-    font-size: 13px;
-  }
-  .filter-count {
-    font-family: var(--mono);
-    font-size: 12px;
-    color: var(--muted);
-    white-space: nowrap;
-  }
+            old = submap.get(sub_id)
+            filename = old["filename"] if old else gen_filename(self.cfg.filename_length)
+            old_hash = old.get("hash") if old else None
+            new_hash = hash_content(links)
 
-  /* ── Table ── */
-  .table-wrap { overflow-x: auto; }
+            if old_hash == new_hash:
+                new_map[sub_id] = old
+                log.debug(f"No change for {email}")
+                continue
 
-  table {
-    width: 100%;
-    border-collapse: collapse;
-  }
-  thead th {
-    font-family: var(--mono);
-    font-size: 10px;
-    font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    color: var(--muted);
-    text-align: left;
-    padding: 10px 28px;
-    border-bottom: 1px solid var(--border);
-    background: var(--surface);
-    position: sticky;
-    top: 61px;
-    z-index: 5;
-  }
-  tbody tr {
-    border-bottom: 1px solid var(--border);
-    transition: background 0.1s;
-  }
-  tbody tr:hover { background: var(--surface); }
-  tbody td {
-    padding: 12px 28px;
-    font-family: var(--mono);
-    font-size: 12px;
-    vertical-align: middle;
-  }
+            self.store.write_sub(filename, links)
+            raw_url = f"{self.cfg.raw_base_url}/{filename}"
 
-  .td-email { color: var(--text); font-weight: 500; }
-  .td-subid { color: var(--muted); font-size: 11px; }
-  .td-file  { color: var(--muted); font-size: 11px; }
-  .td-time  { color: var(--muted); font-size: 11px; }
+            new_map[sub_id] = {
+                "email":      email,
+                "filename":   filename,
+                "hash":       new_hash,
+                "raw_url":    raw_url,
+                "updated":    int(time.time()),
+                "updated_ts": datetime.utcnow().isoformat()
+            }
+            log.info(f"Updated: {email} → {filename}")
 
-  .url-cell a {
-    color: var(--accent2);
-    text-decoration: none;
-    font-size: 11px;
-    border: 1px solid rgba(0,122,255,0.25);
-    border-radius: 3px;
-    padding: 3px 8px;
-    display: inline-block;
-    transition: all 0.1s;
-  }
-  .url-cell a:hover {
-    background: rgba(0,122,255,0.1);
-    border-color: var(--accent2);
-  }
+        # Remove deleted clients
+        for sub_id in list(submap.keys()):
+            if sub_id not in seen_ids:
+                self.store.delete_sub(submap[sub_id]["filename"])
+                log.info(f"Removed deleted client: {submap[sub_id].get('email', sub_id)}")
 
-  .copy-btn {
-    font-family: var(--mono);
-    font-size: 10px;
-    padding: 3px 8px;
-    margin-left: 6px;
-    border-radius: 3px;
-  }
-  .copy-btn.copied {
-    color: var(--accent);
-    border-color: var(--accent);
-  }
+        self.store.save(new_map)
 
-  .rotate-btn {
-    font-size: 10px;
-    padding: 3px 8px;
-    border-radius: 3px;
-    color: var(--warn);
-    border-color: rgba(255,159,67,0.3);
-  }
-  .rotate-btn:hover { border-color: var(--warn) !important; color: var(--warn) !important; }
+        try:
+            self.git.push()
+        except Exception as e:
+            log.error(f"Git push failed: {e}")
 
-  /* ── Empty state ── */
-  .empty {
-    text-align: center;
-    padding: 60px 20px;
-    color: var(--muted);
-    font-family: var(--mono);
-  }
-  .empty h3 { font-size: 16px; margin-bottom: 8px; color: var(--text); }
-  .empty p { font-size: 12px; }
+        log.info("─── Sync complete ───")
+        return new_map
 
-  /* ── Toast ── */
-  .toast {
-    position: fixed;
-    bottom: 24px;
-    right: 24px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-left: 3px solid var(--accent);
-    padding: 12px 20px;
-    font-family: var(--mono);
-    font-size: 12px;
-    border-radius: 4px;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
-    opacity: 0;
-    transform: translateY(8px);
-    transition: all 0.2s;
-    pointer-events: none;
-    z-index: 100;
-  }
-  .toast.show { opacity: 1; transform: translateY(0); }
-  .toast.error { border-left-color: var(--danger); }
+    def lookup(self, query: str):
+        submap = self.store.load()
+        query = query.strip().lower()
+        results = []
+        for sub_id, v in submap.items():
+            if query in v.get("email", "").lower() or query in sub_id.lower():
+                results.append((sub_id, v))
+        return results
 
-  /* ── Sync indicator ── */
-  .sync-dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: var(--muted);
-    display: inline-block;
-    margin-right: 6px;
-  }
-  .sync-dot.running {
-    background: var(--warn);
-    animation: pulse 1s infinite;
-  }
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.3; }
-  }
+    def rotate(self, query: str):
+        submap = self.store.load()
+        query = query.strip().lower()
+        rotated = []
+        for sub_id, v in submap.items():
+            if query in v.get("email", "").lower() or query in sub_id.lower():
+                old_file = v["filename"]
+                new_file = gen_filename(self.cfg.filename_length)
+                # rename file content
+                old_path = SUBS_DIR / old_file
+                if old_path.exists():
+                    content = old_path.read_text()
+                    (SUBS_DIR / new_file).write_text(content)
+                    old_path.unlink()
+                v["filename"] = new_file
+                v["raw_url"]  = f"{self.cfg.raw_base_url}/{new_file}"
+                v["hash"]     = ""  # force re-push
+                submap[sub_id] = v
+                rotated.append((sub_id, v))
+        self.store.save(submap)
+        if rotated:
+            self.git.push()
+        return rotated
 
-  /* ── Responsive ── */
-  @media (max-width: 700px) {
-    header { padding: 14px 16px; }
-    thead th, tbody td { padding: 10px 16px; }
-    .toolbar { padding: 12px 16px; }
-    .stat { padding: 12px 16px; }
-    .td-file, .td-subid { display: none; }
-  }
-</style>
-</head>
-<body>
 
-<header>
-  <div class="logo">git<span>/</span>sub <span style="font-size:11px;margin-left:4px">dashboard</span></div>
-  <div class="header-actions">
-    <span id="sync-indicator"><span class="sync-dot" id="sync-dot"></span><span id="sync-status">idle</span></span>
-    <button class="primary" id="sync-btn" onclick="doSync()">⟳ Sync Now</button>
-  </div>
-</header>
+# ─────────────────────────────────────────
+# DAEMON
+# ─────────────────────────────────────────
 
-<div class="stats" id="stats-bar">
-  <div class="stat">
-    <div class="stat-label">Total Users</div>
-    <div class="stat-value" id="stat-total">—</div>
-  </div>
-  <div class="stat">
-    <div class="stat-label">Active Files</div>
-    <div class="stat-value" id="stat-files">—</div>
-  </div>
-  <div class="stat">
-    <div class="stat-label">GitHub Repo</div>
-    <div class="stat-value" style="font-size:14px;padding-top:4px" id="stat-repo">—</div>
-  </div>
-  <div class="stat">
-    <div class="stat-label">Last Sync</div>
-    <div class="stat-value" style="font-size:13px;padding-top:4px" id="stat-lastsync">—</div>
-  </div>
-</div>
+def run_daemon(interval: int):
+    log.info(f"Daemon started (interval: {interval}s)")
+    while True:
+        try:
+            Engine().sync()
+        except Exception as e:
+            log.error(f"Sync error: {e}")
+        log.info(f"Next sync in {interval}s")
+        time.sleep(interval)
 
-<div class="toolbar">
-  <div class="search-wrap">
-    <span class="search-icon">⌕</span>
-    <input type="text" id="search-input" placeholder="filter by email or sub ID..." oninput="filterTable()">
-  </div>
-  <span class="filter-count" id="filter-count"></span>
-  <button onclick="copyAll()">copy all URLs</button>
-</div>
 
-<div class="table-wrap">
-  <table id="main-table">
-    <thead>
-      <tr>
-        <th>Email</th>
-        <th>Sub ID</th>
-        <th>File</th>
-        <th>Raw URL</th>
-        <th>Updated</th>
-        <th></th>
-      </tr>
-    </thead>
-    <tbody id="table-body">
-      <tr><td colspan="6"><div class="empty"><h3>Loading...</h3></div></td></tr>
-    </tbody>
-  </table>
-</div>
+# ─────────────────────────────────────────
+# CLI HELP
+# ─────────────────────────────────────────
 
-<div class="toast" id="toast"></div>
-
-<script>
-let tableData = [];
-let syncPollTimer = null;
-
-function toast(msg, type='') {
-  const el = document.getElementById('toast');
-  el.textContent = msg;
-  el.className = 'toast show' + (type ? ' ' + type : '');
-  clearTimeout(el._t);
-  el._t = setTimeout(() => el.className = 'toast', 3000);
-}
-
-async function loadData() {
-  const res = await fetch('/api/data');
-  const d = await res.json();
-  tableData = d.entries;
-  renderTable(tableData);
-  document.getElementById('stat-total').textContent = d.total;
-  document.getElementById('stat-files').textContent = d.total;
-  document.getElementById('stat-repo').textContent = d.repo || '—';
-  document.getElementById('stat-lastsync').textContent = d.last_sync || '—';
-  document.getElementById('filter-count').textContent = `${d.total} users`;
-}
-
-function renderTable(rows) {
-  const tbody = document.getElementById('table-body');
-  if (!rows.length) {
-    tbody.innerHTML = `<tr><td colspan="6"><div class="empty"><h3>No subscribers yet</h3><p>Run a sync to populate.</p></div></td></tr>`;
-    return;
-  }
-  tbody.innerHTML = rows.map(r => `
-    <tr>
-      <td class="td-email">${esc(r.email)}</td>
-      <td class="td-subid">${esc(r.sub_id.slice(0,16))}…</td>
-      <td class="td-file">${esc(r.filename)}</td>
-      <td class="url-cell">
-        <a href="${esc(r.raw_url)}" target="_blank">open ↗</a>
-        <button class="copy-btn" onclick="copyURL('${esc(r.raw_url)}', this)">copy</button>
-      </td>
-      <td class="td-time">${esc(r.updated)}</td>
-      <td>
-        <button class="rotate-btn" onclick="rotateUser('${esc(r.sub_id)}', '${esc(r.email)}')">rotate</button>
-      </td>
-    </tr>
-  `).join('');
-}
-
-function esc(s) {
-  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-function filterTable() {
-  const q = document.getElementById('search-input').value.toLowerCase();
-  const filtered = q ? tableData.filter(r =>
-    (r.email || '').toLowerCase().includes(q) ||
-    (r.sub_id || '').toLowerCase().includes(q)
-  ) : tableData;
-  renderTable(filtered);
-  document.getElementById('filter-count').textContent = `${filtered.length} / ${tableData.length} users`;
-}
-
-function copyURL(url, btn) {
-  navigator.clipboard.writeText(url).then(() => {
-    btn.textContent = '✓';
-    btn.classList.add('copied');
-    setTimeout(() => { btn.textContent = 'copy'; btn.classList.remove('copied'); }, 1500);
-  });
-}
-
-function copyAll() {
-  const urls = tableData.map(r => r.raw_url).join('\n');
-  navigator.clipboard.writeText(urls).then(() => toast('Copied all URLs'));
-}
-
-async function doSync() {
-  const btn = document.getElementById('sync-btn');
-  btn.disabled = true;
-  const res = await fetch('/api/sync', { method: 'POST' });
-  const d = await res.json();
-  if (d.ok) {
-    toast('Sync started...');
-    pollSync();
-  } else {
-    toast(d.msg || 'Already running', 'error');
-    btn.disabled = false;
-  }
-}
-
-async function pollSync() {
-  clearInterval(syncPollTimer);
-  syncPollTimer = setInterval(async () => {
-    const res = await fetch('/api/sync/status');
-    const d = await res.json();
-    const dot = document.getElementById('sync-dot');
-    const status = document.getElementById('sync-status');
-    const btn = document.getElementById('sync-btn');
-    if (d.running) {
-      dot.className = 'sync-dot running';
-      status.textContent = 'syncing';
-    } else {
-      dot.className = 'sync-dot';
-      status.textContent = 'idle';
-      btn.disabled = false;
-      clearInterval(syncPollTimer);
-      loadData();
-      toast('Sync complete ✓');
-    }
-  }, 2000);
-}
-
-async function rotateUser(sub_id, email) {
-  if (!confirm(`Rotate URL for ${email}? Their subscription link will change.`)) return;
-  const res = await fetch('/api/rotate', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sub_id })
-  });
-  const d = await res.json();
-  if (d.ok) {
-    toast(`Rotated: ${email}`);
-    loadData();
-  } else {
-    toast(d.msg || 'Rotate failed', 'error');
-  }
-}
-
-// Init
-loadData();
-</script>
-</body>
-</html>
+HELP = """
+╔═══════════════════════════════════════════════╗
+║          gitsub — XUI Subscription Sync       ║
+╠═══════════════════════════════════════════════╣
+║  Commands:                                    ║
+║                                               ║
+║  gitsub sync                sync now          ║
+║  gitsub daemon              run as daemon     ║
+║  gitsub daemon --interval N set sync every Ns ║
+║  gitsub lookup <email|id>   find a user       ║
+║  gitsub rotate <email|id>   rotate URL        ║
+║  gitsub status              show submap stats ║
+║  gitsub webui               start web UI      ║
+║  gitsub help                show this         ║
+╠═══════════════════════════════════════════════╣
+║  Management:                                  ║
+║                                               ║
+║  bash install.sh            install           ║
+║  bash uninstall.sh          uninstall         ║
+╚═══════════════════════════════════════════════╝
 """
 
 
 # ─────────────────────────────────────────
-# API Routes
-# ─────────────────────────────────────────
-
-@app.route("/")
-def index():
-    return HTML
-
-
-@app.route("/api/data")
-def api_data():
-    submap = load_submap()
-    cfg = load_config()
-
-    entries = []
-    last_ts = 0
-    for sub_id, v in submap.items():
-        entries.append({
-            "sub_id":   sub_id,
-            "email":    v.get("email", "—"),
-            "filename": v.get("filename", ""),
-            "raw_url":  v.get("raw_url", ""),
-            "updated":  format_ts(v.get("updated")),
-        })
-        ts = v.get("updated", 0)
-        if ts > last_ts:
-            last_ts = ts
-
-    repo = f"{cfg.get('github_user', '')}/{cfg.get('github_repo', '')}"
-    last_sync = format_ts(last_ts) if last_ts else "never"
-
-    entries.sort(key=lambda x: x["email"])
-
-    return jsonify({
-        "total":     len(entries),
-        "entries":   entries,
-        "repo":      repo,
-        "last_sync": last_sync,
-    })
-
-
-@app.route("/api/sync", methods=["POST"])
-def api_sync():
-    started = trigger_sync()
-    if started:
-        return jsonify({"ok": True})
-    return jsonify({"ok": False, "msg": "Sync already running"}), 409
-
-
-@app.route("/api/sync/status")
-def api_sync_status():
-    return jsonify({"running": _sync_running})
-
-
-@app.route("/api/rotate", methods=["POST"])
-def api_rotate():
-    data = request.get_json(silent=True) or {}
-    sub_id = data.get("sub_id", "").strip()
-    if not sub_id:
-        return jsonify({"ok": False, "msg": "sub_id required"}), 400
-
-    submap = load_submap()
-    if sub_id not in submap:
-        return jsonify({"ok": False, "msg": "Not found"}), 404
-
-    # Trigger rotate via update.py
-    email = submap[sub_id].get("email", sub_id)
-    result = subprocess.run(
-        [sys.executable, str(BASE_DIR / "update.py"), "rotate", email],
-        cwd=BASE_DIR, capture_output=True, text=True
-    )
-    if result.returncode == 0:
-        return jsonify({"ok": True})
-    return jsonify({"ok": False, "msg": result.stderr or "Rotate failed"}), 500
-
-
-# ─────────────────────────────────────────
-# Run
+# MAIN
 # ─────────────────────────────────────────
 
 if __name__ == "__main__":
-    print(f"  gitsub WebUI → http://0.0.0.0:{PORT}")
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    args = sys.argv[1:]
+
+    if not args or args[0] in ("help", "--help", "-h"):
+        print(HELP)
+
+    elif args[0] == "sync":
+        Engine().sync()
+
+    elif args[0] == "daemon":
+        interval = 21600
+        if "--interval" in args:
+            idx = args.index("--interval")
+            interval = int(args[idx + 1])
+        run_daemon(interval)
+
+    elif args[0] == "lookup":
+        if len(args) < 2:
+            print("Usage: gitsub lookup <email or subId>")
+            sys.exit(1)
+        results = Engine().lookup(args[1])
+        if not results:
+            print("Not found.")
+        for sub_id, v in results:
+            print(f"\n  Email   : {v.get('email')}")
+            print(f"  SubID   : {sub_id}")
+            print(f"  URL     : {v.get('raw_url')}")
+            print(f"  Updated : {v.get('updated_ts', 'N/A')}")
+
+    elif args[0] == "rotate":
+        if len(args) < 2:
+            print("Usage: gitsub rotate <email or subId>")
+            sys.exit(1)
+        results = Engine().rotate(args[1])
+        if not results:
+            print("Not found.")
+        for sub_id, v in results:
+            print(f"  Rotated: {v.get('email')} → new URL: {v.get('raw_url')}")
+
+    elif args[0] == "status":
+        submap = Store().load()
+        print(f"\n  Total users: {len(submap)}")
+        for sub_id, v in submap.items():
+            print(f"  • {v.get('email', sub_id):30s}  {v.get('raw_url', 'N/A')}")
+
+    elif args[0] == "webui":
+        os.execv(sys.executable, [sys.executable, str(BASE_DIR / "webui.py")])
+
+    else:
+        print(f"Unknown command: {args[0]}")
+        print(HELP)
+        sys.exit(1)
