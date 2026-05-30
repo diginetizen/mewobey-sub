@@ -1,123 +1,79 @@
-# XUI Subscription Sync System
+# XUI Subscription Sync (GitHub Edition)
 
-A production-ready automation system for **3x-ui v3.2** that generates GitHub-hosted subscription files for each client and keeps them automatically synced.
-
----
-
-## 🚀 Features
-
-### Core Features
-- Auto-fetch all 3x-ui clients via API
-- Generate per-user subscription files
-- GitHub raw link distribution
-- Automatic sync (daemon mode)
-- Manual sync support
-- Subscription rotation per user
-- Lookup by email or subId
-- Auto cleanup of deleted users
-
-### Production Features
-- Systemd service support (auto start on reboot)
-- Change detection (no unnecessary Git commits)
-- Secure random filenames (32 characters)
-- Retry + timeout API handling
-- Lock-safe execution (prevents duplicate runs)
-- Logging support
-- Git auto commit + push
+A simple automation tool for **3x-ui v3.2** that generates GitHub-hosted subscription links per user and keeps them synced automatically.
 
 ---
 
-## ⚙️ Installation
+## 🚀 What it does
 
-### 🟢 Automatic Installation (Recommended)
+- Fetches all users from 3x-ui API
+- Gets subscription links per user
+- Creates a unique `.txt` file for each user
+- Uploads to GitHub (raw links)
+- Auto updates when subscriptions change
+- Removes deleted users automatically
 
-Run:
+---
+
+## 🔗 Output Example
+
+Each user gets a link like:
+
+
+https://raw.githubusercontent.com/diginetizen/mewobey-sub/main/subs/AbC123XyZ987.txt
+
+
+---
+
+## ⚙️ Installation (EASY MODE)
+
+### 1. Run installer
 
 ```bash
 bash install.sh
 
-It will:
+It will ask:
 
-Ask for panel URL
-Ask for API token
-Configure GitHub repository
-Install dependencies
-Setup systemd service
-Enable auto-start
-Run initial sync
-🔵 Manual Installation
-1. Clone repo
-git clone git@github.com:diginetizen/mewobey-sub.git
-cd mewobey-sub
-2. Setup Python environment
-python3 -m venv venv
-source venv/bin/activate
-pip install requests
-3. Configure system
-
-Create config.json:
-
-{
-  "panel_url": "https://YOUR_PANEL",
-  "api_token": "YOUR_TOKEN",
-  "github_username": "diginetizen",
-  "github_repository": "mewobey-sub",
-  "github_branch": "main",
-  "filename_length": 32,
-  "request_timeout": 20,
-  "request_retries": 3
-}
-4. Run first sync
+Panel URL
+API token
+GitHub repo
+Sync mode (daemon recommended)
+🧠 Run manually (optional)
+Sync once
 python update.py sync
-🔄 Running Modes
-🟢 Daemon Mode (Recommended)
-
-Runs continuously and syncs automatically:
-
+Run continuously (recommended)
 python update.py daemon
 
-Custom interval:
+Test mode (fast sync every 2 min):
 
-python update.py daemon --interval 21600   # 6 hours (production)
-python update.py daemon --interval 120      # 2 minutes (test)
-🔵 Manual Sync
+python update.py daemon --interval 120
 
-Run once:
+Production mode (every 6 hours):
 
-python update.py sync
-🔁 Subscription Rotation
+python update.py daemon --interval 21600
+🔍 Lookup user
 
-Generate a new subscription file for a user:
-
-python update.py rotate user@example.com
-🔍 Lookup User
-
-Find subscription details:
+Find subscription info:
 
 python update.py lookup user@example.com
 
 or by subId:
 
-python update.py lookup a68ykk383mnjqnp0
-🧠 System Behavior
-Sync Process
-Fetch all clients from 3x-ui
-Get subscription links per client
-Generate or update subscription file
-Detect changes (skip if unchanged)
-Remove deleted users
-Push updates to GitHub
-🔗 Subscription URL Format
+python update.py lookup SUB_ID
+🔁 Rotate subscription
 
-Each user gets:
+Generate new link for a user:
 
-https://raw.githubusercontent.com/diginetizen/mewobey-sub/main/subs/<random>.txt
-🛠 Systemd Service (Auto Start)
+python update.py rotate user@example.com
+🛠 System Service (Auto Start)
 
-Enable service:
+Start service:
+
+systemctl start xui-subsync
+
+Enable on boot:
 
 systemctl enable xui-subsync
-systemctl start xui-subsync
 
 Check status:
 
@@ -126,50 +82,19 @@ systemctl status xui-subsync
 Logs:
 
 journalctl -u xui-subsync -f
-🧪 Testing
-Quick test sync:
-python update.py sync
-Test daemon (fast mode):
-python update.py daemon --interval 120
-⚠️ Security Notes
+📁 Project Files
+update.py        → main script
+config.json      → settings (DO NOT SHARE)
+submap.json      → local mapping (DO NOT SHARE)
+subs/            → generated subscription files
+logs/            → system logs
+install.sh       → auto installer
+⚠️ Important
 Never commit config.json
-Never expose API token publicly
-Keep submap.json local only
-Use SSH Git authentication recommended
-🔧 Troubleshooting
-Service not found
-
-Run:
-
-systemctl daemon-reload
-Sync not working
-
-Check logs:
-
+Never expose API token
+Use SSH Git (recommended)
+Keep VPS secure
+🧪 Quick Test
 python update.py sync
 
-or:
-
-journalctl -u xui-subsync -n 50
-📌 Summary
-
-This system provides:
-
-Fully automated subscription distribution
-GitHub-hosted config files
-Per-user isolation
-Production-ready daemon mode
-Easy installation and scaling
-🚀 Done
-
----
-
-# 👍 What you now have
-
-You now have:
-
-✔ full automation system  
-✔ manual + auto modes  
-✔ installer support  
-✔ production daemon  
-✔ clean documentation  
+If files appear in subs/ → system is working.
