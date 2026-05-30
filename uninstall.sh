@@ -1,42 +1,49 @@
 #!/bin/bash
+# gitsub uninstaller
 
-echo "====================================="
-echo " XUI SUBSYNC UNINSTALLER"
-echo "====================================="
+INSTALL_DIR="/opt/xui-subsync"
+GREEN="\033[0;32m"; YELLOW="\033[1;33m"; CYAN="\033[0;36m"; RED="\033[0;31m"; RESET="\033[0m"
+info()    { echo -e "${CYAN}[info]${RESET} $*"; }
+success() { echo -e "${GREEN}[ok]${RESET}   $*"; }
+warn()    { echo -e "${YELLOW}[warn]${RESET} $*"; }
 
-read -p "Are you sure? (yes/no): " CONFIRM
+echo ""
+echo -e "${YELLOW}══════════════════════════════════════════${RESET}"
+echo -e "${YELLOW}   gitsub Uninstaller                     ${RESET}"
+echo -e "${YELLOW}══════════════════════════════════════════${RESET}"
+echo ""
+read -rp "  Are you sure you want to uninstall? [yes/no]: " CONFIRM
+[ "$CONFIRM" != "yes" ] && echo "Cancelled." && exit 0
 
-if [ "$CONFIRM" != "yes" ]; then
-    echo "Cancelled"
-    exit 0
-fi
+info "Stopping services..."
+systemctl stop xui-subsync 2>/dev/null || true
+systemctl stop xui-webui   2>/dev/null || true
 
-echo "[1] Stopping services..."
-systemctl stop xui-subsync 2>/dev/null
-systemctl stop xui-webui 2>/dev/null
+info "Disabling services..."
+systemctl disable xui-subsync 2>/dev/null || true
+systemctl disable xui-webui   2>/dev/null || true
 
-echo "[2] Disabling services..."
-systemctl disable xui-subsync 2>/dev/null
-systemctl disable xui-webui 2>/dev/null
-
-echo "[3] Removing systemd files..."
+info "Removing systemd files..."
 rm -f /etc/systemd/system/xui-subsync.service
 rm -f /etc/systemd/system/xui-webui.service
 systemctl daemon-reload
 
-echo "[4] Removing nginx config..."
+info "Removing nginx config..."
 rm -f /etc/nginx/sites-enabled/xui-webui
 rm -f /etc/nginx/sites-available/xui-webui
-systemctl restart nginx 2>/dev/null
+systemctl reload nginx 2>/dev/null || true
 
-echo "[5] Removing project files..."
-read -p "Delete /opt/xui-subsync? (yes/no): " DEL
+info "Removing CLI command..."
+rm -f /usr/local/bin/gitsub
 
+echo ""
+read -rp "  Delete project files at $INSTALL_DIR? [yes/no]: " DEL
 if [ "$DEL" = "yes" ]; then
-    rm -rf /opt/xui-subsync
-    echo "Deleted"
+    rm -rf "$INSTALL_DIR"
+    success "Project files deleted"
 else
-    echo "Kept project"
+    warn "Kept project files at $INSTALL_DIR"
 fi
 
-echo "DONE"
+echo ""
+success "Uninstall complete."
