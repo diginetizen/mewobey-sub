@@ -32,6 +32,22 @@ def load_config() -> dict:
     with open(CONFIG_FILE) as f:
         return json.load(f)
 
+def save_config_key(key, value):
+    cfg = load_config()
+    cfg[key] = value
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+    CONFIG_FILE.chmod(0o600)
+
+def get_or_create_secret() -> str:
+    """Persist Flask secret key in config so sessions survive restarts."""
+    cfg = load_config()
+    if cfg.get("flask_secret"):
+        return cfg["flask_secret"]
+    secret = secrets.token_hex(32)
+    save_config_key("flask_secret", secret)
+    return secret
+
 def load_submap() -> dict:
     if not SUBMAP_FILE.exists():
         return {}
@@ -46,9 +62,16 @@ def format_ts(epoch):
     except Exception:
         return "—"
 
-# Flask secret key (regenerated per process, sessions last until restart — fine for single-server use)
-cfg = load_config()
-app.secret_key = cfg.get("flask_secret") or secrets.token_hex(32)
+# Persistent secret key — sessions survive service restarts
+app.secret_key = get_or_create_secret()
+# Tell Flask it's behind a reverse proxy (needed for HTTPS to work correctly)
+app.config["SESSION_COOKIE_SECURE"] = False   # works on both HTTP and HTTPS
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+# Handle X-Forwarded-Proto from nginx so redirect() uses https://
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # ─────────────────────────────────────────
 # Auth
@@ -198,14 +221,20 @@ DASH_HTML = r"""<!DOCTYPE html>
   .srch-ic{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--muted);font-size:13px}
   .cnt{font-family:var(--mono);font-size:11px;color:var(--muted);white-space:nowrap}
 
+  /* ── Layout ── */
+  .page-wrap{display:flex;flex-direction:column;min-height:100vh}
+
   table{width:100%;border-collapse:collapse}
+  /* thead sticks below the toolbar — use scroll container instead of fixed offset */
+  .table-scroll{overflow-x:auto;flex:1}
   thead th{font-family:var(--mono);font-size:10px;font-weight:500;text-transform:uppercase;
            letter-spacing:1px;color:var(--muted);text-align:left;padding:10px 28px;
            border-bottom:1px solid var(--border);background:var(--surface);
-           position:sticky;top:57px;z-index:5}
+           white-space:nowrap}
+  /* sticky header handled via JS scrolling the .table-scroll container, not position:sticky */
   tbody tr{border-bottom:1px solid var(--border);transition:background 0.1s}
   tbody tr:hover{background:var(--surface)}
-  tbody td{padding:11px 28px;font-family:var(--mono);font-size:12px;vertical-align:middle}
+  tbody td{padding:10px 28px;font-family:var(--mono);font-size:12px;vertical-align:top}
 
   .td-email{color:var(--text);font-weight:500}
   .td-sub{color:var(--muted);font-size:10px}
@@ -271,12 +300,17 @@ DASH_HTML = r"""<!DOCTYPE html>
   <button onclick="copyAll()">copy all URLs</button>
 </div>
 
-<div style="overflow-x:auto">
+<div class="table-scroll">
 <table>
   <thead><tr>
-    <th>Email</th><th>Sub ID</th><th>Raw URL</th><th>Updated</th><th></th>
+    <th>Email</th>
+    <th>Sub ID</th>
+    <th>File</th>
+    <th>Raw URL</th>
+    <th>Last Updated</th>
+    <th></th>
   </tr></thead>
-  <tbody id="tbody"><tr><td colspan="5"><div class="empty"><h3>Loading…</h3></div></td></tr></tbody>
+  <tbody id="tbody"><tr><td colspan="6"><div class="empty"><h3>Loading…</h3></div></td></tr></tbody>
 </table>
 </div>
 
@@ -314,16 +348,22 @@ async function loadData() {
 function render(data) {
   const tb = document.getElementById('tbody');
   if (!data.length) {
-    tb.innerHTML = '<tr><td colspan="5"><div class="empty"><h3>No subscribers yet</h3><p>Run a sync to populate.</p></div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="6"><div class="empty"><h3>No subscribers yet</h3><p>Run a sync to populate.</p></div></td></tr>';
     return;
   }
   tb.innerHTML = data.map(r => `
     <tr>
       <td class="td-email">${esc(r.email)}</td>
-      <td class="td-sub" title="${esc(r.sub_id)}">${esc(r.sub_id.slice(0,12))}…</td>
+      <td class="td-sub">
+        <div title="${esc(r.sub_id)}">${esc(r.sub_id.slice(0,16))}…</div>
+      </td>
+      <td class="td-sub" style="color:var(--muted)">${esc(r.filename)}</td>
       <td>
-        <a class="url-link" href="${esc(r.raw_url)}" target="_blank">open ↗</a>
-        <button class="copy-btn" onclick="copyURL('${esc(r.raw_url)}',this)">copy</button>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+          <a class="url-link" href="${esc(r.raw_url)}" target="_blank">open ↗</a>
+          <button class="copy-btn" onclick="copyURL('${esc(r.raw_url)}',this)">copy</button>
+        </div>
+        <div style="font-size:10px;color:var(--muted);margin-top:3px;word-break:break-all">${esc(r.raw_url)}</div>
       </td>
       <td class="td-time">${esc(r.updated)}</td>
       <td><button class="rot-btn" onclick="rotate('${esc(r.sub_id)}','${esc(r.email)}')">rotate</button></td>
@@ -338,15 +378,41 @@ function filter() {
 }
 
 function copyURL(url, btn) {
-  navigator.clipboard.writeText(url).then(() => {
+  function fallback() {
+    const ta = document.createElement('textarea');
+    ta.value = url;
+    ta.style.cssText = 'position:fixed;opacity:0;top:0;left:0';
+    document.body.appendChild(ta);
+    ta.focus(); ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+  }
+  const done = () => {
     btn.textContent = '✓'; btn.classList.add('ok');
     setTimeout(() => { btn.textContent = 'copy'; btn.classList.remove('ok'); }, 1500);
-  });
+  };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(url).then(done).catch(fallback);
+    done();
+  } else {
+    fallback(); done();
+  }
 }
 
 function copyAll() {
-  navigator.clipboard.writeText(rows.map(r => r.raw_url).join('\n'))
-    .then(() => toast('Copied all URLs'));
+  const urls = rows.map(r => r.raw_url).join('\n');
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(urls).then(() => toast('Copied all URLs'));
+  } else {
+    const ta = document.createElement('textarea');
+    ta.value = urls;
+    ta.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(ta);
+    ta.focus(); ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    toast('Copied all URLs');
+  }
 }
 
 async function doSync() {
@@ -445,7 +511,6 @@ def api_data():
         "repo":      f"{cfg.get('github_user','')}/{cfg.get('github_repo','')}",
         "last_sync": format_ts(last_ts) if last_ts else "never",
     })
-
 @app.route("/api/sync", methods=["POST"])
 @login_required
 def api_sync():
