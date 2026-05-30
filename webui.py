@@ -64,14 +64,15 @@ def format_ts(epoch):
 
 # Persistent secret key — sessions survive service restarts
 app.secret_key = get_or_create_secret()
-# Tell Flask it's behind a reverse proxy (needed for HTTPS to work correctly)
-app.config["SESSION_COOKIE_SECURE"] = False   # works on both HTTP and HTTPS
+# SESSION_COOKIE_SECURE = False so cookie works whether accessed via HTTP or HTTPS
+# (nginx handles TLS termination; Flask only sees plain HTTP internally)
+app.config["SESSION_COOKIE_SECURE"]   = False
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
-# Handle X-Forwarded-Proto from nginx so redirect() uses https://
+# ProxyFix: trust X-Forwarded-Proto/Host from nginx (1 hop)
 from werkzeug.middleware.proxy_fix import ProxyFix
-app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1, x_for=1)
 
 # ─────────────────────────────────────────
 # Auth
