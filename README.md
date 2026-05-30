@@ -1,34 +1,10 @@
-# gitsub — XUI Subscription Sync
+# gitsub — XUI Subscription Sync v3
 
-Automatically syncs per-user subscription files from your **3x-ui** panel to a GitHub-hosted repo, with a clean web dashboard and full CLI control.
-
----
-
-## How it works
-
-1. Fetches all clients from your 3x-ui API
-2. Gets each client's subscription links via subId
-3. Writes links to a random-named `.txt` file in `subs/`
-4. Pushes changes to GitHub (only if content changed)
-5. The raw GitHub URL becomes the user's subscription link
-6. Deleted users are cleaned up automatically
-7. Runs on a timer or as a systemd daemon
-
-**Security:** filenames are random (32-char alphanumeric). No email or subId is in the filename or URL. `config.json` and `submap.json` are never pushed to GitHub.
+Syncs per-user subscription files from your **3x-ui** panel to a GitHub repo, with a web dashboard, login protection, interactive CLI menu, and full settings manager.
 
 ---
 
-## Requirements
-
-- Ubuntu 22.04+
-- Python 3.10+
-- Git
-- 3x-ui panel with API access (Bearer token)
-- A GitHub repository (public or private)
-
----
-
-## Installation
+## Install
 
 ```bash
 git clone https://github.com/diginetizen/mewobey-sub.git
@@ -36,143 +12,144 @@ cd mewobey-sub
 bash install.sh
 ```
 
-The installer will ask you for:
+The installer asks step by step:
+- Panel URL + API token
+- GitHub username / repo / branch
+- Deploy method: **Token** or **SSH key**
+  - SSH: generates a key if you don't have one, shows the public key, gives you the exact GitHub link to add it, then tests the connection
+- Web UI: port, **username + password**
+- Nginx + domain (optional) + **SSL certificate via Certbot** (optional, installs right now)
+- Sync interval (menu: 6h / 1h / 5min / custom)
+- Confirmation summary before anything is written
 
-| Prompt | Description |
-|---|---|
-| Panel URL | Your 3x-ui panel URL, e.g. `https://panel.example.com` |
-| API Token | Bearer token from 3x-ui |
-| GitHub username / repo | Where to push subscription files |
-| Deploy method | **Token** (HTTPS) or **SSH key** |
-| Web UI | Enable dashboard (recommended) |
-| Nginx | Optional reverse proxy + domain |
-| Sync interval | Seconds between syncs (default: 21600 = 6h) |
-
-### Deploy methods
-
-**Option 1 — Personal Access Token (easier)**
-Paste a GitHub PAT with `repo` scope. Stored in `config.json` (chmod 600, never pushed).
-
-**Option 2 — SSH Deploy Key (more secure)**
-- If you have an existing SSH key: point to it
-- If not: the installer generates one and shows you the public key
-- Add the public key to your repo: **Settings → Deploy keys → Add deploy key → Allow write access**
-- The installer gives you the exact URL to click
+Git commit identity is set automatically from your GitHub username — no separate email prompt.
 
 ---
 
-## Files installed
+## Usage
+
+Type `gitsub` with no arguments to open the interactive menu:
 
 ```
-/opt/xui-subsync/
-├── update.py        # sync engine + CLI
-├── webui.py         # web dashboard
-├── requirements.txt
-├── install.sh
-├── uninstall.sh
-├── config.json      # your credentials (chmod 600, not in git)
-├── submap.json      # email↔filename map (not in git)
-├── subs/            # subscription files (pushed to GitHub)
-│   └── <random>.txt
-└── logs/
-    ├── sync.log
-    └── error.log
+╔══════════════════════════════════════════╗
+║  gitsub — XUI Subscription Sync          ║
+╠══════════════════════════════════════════╣
+║  Services:  sync  ● active               ║
+║             webui ● active               ║
+╠══════════════════════════════════════════╣
+║  1  Sync now (manual run)                ║
+║  2  Show all users & URLs                ║
+║  3  Lookup user by email / sub ID        ║
+║  4  Rotate user URL                      ║
+║  5  View logs (live)                     ║
+║  6  Settings — view & change             ║
+║  7  Restart services                     ║
+║  8  Service status details               ║
+║  0  Exit                                 ║
+╚══════════════════════════════════════════╝
 ```
 
----
-
-## CLI — `gitsub`
-
-After install, `gitsub` is available system-wide:
-
-```
-gitsub sync                   sync now (one-time)
-gitsub daemon                 run daemon (uses config interval)
-gitsub daemon --interval 300  run daemon, sync every 5 minutes
-gitsub lookup <email|subId>   find a user and show their URL
-gitsub rotate <email|subId>   rotate URL (generates new filename)
-gitsub status                 list all users and their raw URLs
-gitsub webui                  start the web dashboard manually
-gitsub help                   show all commands
-```
-
----
-
-## Systemd services
-
-Both services are installed and started automatically:
+Or use direct commands:
 
 ```bash
-# Sync daemon
-systemctl status xui-subsync
-systemctl restart xui-subsync
-journalctl -u xui-subsync -f
-
-# Web UI
-systemctl status xui-webui
-systemctl restart xui-webui
-journalctl -u xui-webui -f
+gitsub sync                    # sync now
+gitsub daemon --interval 3600  # run daemon
+gitsub lookup <email|subId>    # find user
+gitsub rotate <email|subId>    # rotate URL
+gitsub status                  # list all users
+gitsub settings                # view settings
+gitsub settings edit           # change a setting
+gitsub webui                   # start web UI manually
+gitsub help                    # all commands
 ```
+
+---
+
+## Settings manager
+
+From the menu → **6 → b** (or `gitsub settings edit`) you can change any setting live:
+
+- Panel URL / API token
+- GitHub username, repo, branch
+- Switch deploy method (token ↔ SSH)
+- GitHub token or SSH key path
+- Web UI port, username, password
+- Sync interval
+- Filename length
+
+After saving, it offers to restart the affected services immediately.
 
 ---
 
 ## Web Dashboard
 
-Access at `http://YOUR_IP:2086` (or your domain if Nginx is configured).
+Access at `http://YOUR_IP:PORT` (default port 2086).
 
-Features:
-- Live user table with subscription URLs
-- One-click **Sync Now**
-- **Copy URL** / **Copy all URLs**
-- Per-user **Rotate** (generates new random URL)
-- Search/filter by email or subId
-- Shows last sync time and repo info
+- Login with the username/password set during install
+- Live sync status indicator
+- Table of all users with their raw subscription URLs
+- **Sync Now** button with live progress
+- **Copy URL** per user or **Copy all URLs**
+- **Rotate** button per user
+- Search/filter by email or sub ID
 
 ---
 
-## Nginx + SSL (optional)
+## SSH deploy key — fixing "Permission denied" errors
 
-The installer can set up Nginx automatically. To add SSL after install:
+The most common SSH issue is the wrong host being used. This project uses a **named SSH alias** (`github-gitsub`) in `~/.ssh/config` so it can use a specific key. Make sure:
+
+1. `/root/.ssh/config` contains:
+   ```
+   Host github-gitsub
+       HostName github.com
+       User git
+       IdentityFile /root/.ssh/gitsub_deploy
+       IdentitiesOnly yes
+       StrictHostKeyChecking no
+   ```
+2. The public key (`/root/.ssh/gitsub_deploy.pub`) is added to your repo under **Settings → Deploy keys** with **Allow write access** checked.
+3. Test with: `ssh -i /root/.ssh/gitsub_deploy -T git@github.com` — should say "successfully authenticated"
+
+If you get "Could not read from remote repository" after all that, run:
+```bash
+gitsub settings edit   # change deploy method or key path
+# then choose to restart services
+```
+
+---
+
+## Nginx + SSL
+
+The installer sets up Nginx and optionally runs Certbot automatically. To do it manually after install:
 
 ```bash
 apt install certbot python3-certbot-nginx
 certbot --nginx -d your.domain.com
 ```
 
-Manual Nginx config:
+---
 
-```nginx
-server {
-    listen 80;
-    server_name your.domain.com;
-
-    location / {
-        proxy_pass       http://127.0.0.1:2086;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-}
-```
+## Logs
 
 ```bash
-ln -s /etc/nginx/sites-available/xui-webui /etc/nginx/sites-enabled/
-nginx -t && systemctl reload nginx
+# From the menu → option 5
+# Or directly:
+tail -f /opt/xui-subsync/logs/sync.log
+tail -f /opt/xui-subsync/logs/error.log
+journalctl -u xui-subsync -f
+journalctl -u xui-webui -f
 ```
 
 ---
 
-## Update / re-pull
-
-If you want to pull a new version from GitHub without re-running the full installer:
+## Services
 
 ```bash
-cd /opt/xui-subsync
-git pull origin main
-systemctl restart xui-subsync
-systemctl restart xui-webui
+systemctl status xui-subsync
+systemctl status xui-webui
+systemctl restart xui-subsync xui-webui
 ```
-
-> **Note:** If you get a "diverged history" error (someone else pushed to the repo), the sync engine automatically does a `git fetch + rebase` before every push to handle this cleanly.
 
 ---
 
@@ -181,40 +158,3 @@ systemctl restart xui-webui
 ```bash
 bash /opt/xui-subsync/uninstall.sh
 ```
-
-Removes services, nginx config, CLI command, and optionally the project directory.
-
----
-
-## Logs
-
-```bash
-# Live sync log
-tail -f /opt/xui-subsync/logs/sync.log
-
-# Error log only
-tail -f /opt/xui-subsync/logs/error.log
-
-# Systemd journal
-journalctl -u xui-subsync -f
-```
-
----
-
-## Troubleshooting
-
-**Push fails with "Updates were rejected"**
-The sync engine does a rebase automatically. If it still fails, the remote may have commits that conflict. Run:
-```bash
-cd /opt/xui-subsync && git fetch origin main && git reset --hard origin/main
-```
-Then trigger a sync: `gitsub sync`
-
-**API returns empty list**
-Check your panel URL (no trailing slash) and verify the Bearer token is valid.
-
-**Web UI not accessible**
-Check the service: `systemctl status xui-webui`. Make sure port 2086 is open in your firewall (`ufw allow 2086`).
-
-**SSH key not working**
-Test with: `ssh -T git@github.com` — you should see "successfully authenticated". Make sure the public key is added to your repo's Deploy Keys with write access.
