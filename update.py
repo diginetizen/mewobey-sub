@@ -1,675 +1,539 @@
-#!/usr/bin/env python3
-"""
-gitsub - XUI Subscription Sync Engine
-"""
+#!/bin/bash
+# ══════════════════════════════════════════════
+#  gitsub installer v3
+#  Installs to /opt/xui-subsync
+# ══════════════════════════════════════════════
 
-import os
-import sys
-import json
-import time
-import hashlib
-import secrets
-import string
-import subprocess
-import logging
-from pathlib import Path
-from datetime import datetime
+set -e
 
-import requests
+INSTALL_DIR="/opt/xui-subsync"
+SERVICE_SYNC="xui-subsync"
+SERVICE_UI="xui-webui"
+NGINX_CONF="/etc/nginx/sites-available/xui-webui"
 
-# ─────────────────────────────────────────
-# PATHS
-# ─────────────────────────────────────────
+GREEN="\033[0;32m"; YELLOW="\033[1;33m"; CYAN="\033[0;36m"; RED="\033[0;31m"; BOLD="\033[1m"; RESET="\033[0m"
+info()    { echo -e "${CYAN}[info]${RESET} $*"; }
+success() { echo -e "${GREEN}[ok]${RESET}   $*"; }
+warn()    { echo -e "${YELLOW}[warn]${RESET} $*"; }
+error()   { echo -e "${RED}[err]${RESET}  $*"; exit 1; }
+ask()     { echo -e "${BOLD}$*${RESET}"; }
 
-BASE_DIR    = Path(__file__).resolve().parent
-CONFIG_FILE = BASE_DIR / "config.json"
-SUBMAP_FILE = BASE_DIR / "submap.json"
-SUBS_DIR    = BASE_DIR / "subs"
-LOG_DIR     = BASE_DIR / "logs"
-
-LOG_DIR.mkdir(exist_ok=True)
-SUBS_DIR.mkdir(exist_ok=True)
+echo ""
+echo -e "${CYAN}╔══════════════════════════════════════════╗${RESET}"
+echo -e "${CYAN}║   gitsub — XUI Subscription Sync v3      ║${RESET}"
+echo -e "${CYAN}╚══════════════════════════════════════════╝${RESET}"
+echo ""
 
 # ─────────────────────────────────────────
-# LOGGING
+# 1. Panel
 # ─────────────────────────────────────────
-
-log = logging.getLogger("gitsub")
-log.setLevel(logging.DEBUG)
-_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
-for handler, level, path in [
-    (logging.FileHandler, logging.DEBUG, LOG_DIR / "sync.log"),
-    (logging.FileHandler, logging.ERROR, LOG_DIR / "error.log"),
-]:
-    h = handler(path)
-    h.setLevel(level)
-    h.setFormatter(_fmt)
-    log.addHandler(h)
-
-_sh = logging.StreamHandler()
-_sh.setFormatter(_fmt)
-log.addHandler(_sh)
+echo -e "${YELLOW}── 3x-ui Panel ───────────────────────────${RESET}"
+echo "  Enter your 3x-ui panel's base URL including port."
+echo "  This is the URL you open in a browser to reach the panel."
+echo "  Example: https://panel.example.com:2053"
+echo "           http://1.2.3.4:54321"
+echo ""
+read -rp "  Panel API base URL: " PANEL_API_URL
+read -rp "  API Bearer Token: " API_TOKEN
+echo ""
 
 # ─────────────────────────────────────────
-# COLORS
+# 2. GitHub repo
 # ─────────────────────────────────────────
-
-C  = "\033[0;36m"   # cyan
-G  = "\033[0;32m"   # green
-Y  = "\033[1;33m"   # yellow
-R  = "\033[0;31m"   # red
-B  = "\033[1m"      # bold
-DIM= "\033[2m"      # dim
-RS = "\033[0m"      # reset
-
-def cyan(s):   return f"{C}{s}{RS}"
-def green(s):  return f"{G}{s}{RS}"
-def yellow(s): return f"{Y}{s}{RS}"
-def red(s):    return f"{R}{s}{RS}"
-def bold(s):   return f"{B}{s}{RS}"
-def dim(s):    return f"{DIM}{s}{RS}"
+echo -e "${YELLOW}── GitHub Repository ─────────────────────${RESET}"
+read -rp "  GitHub username: " GITHUB_USER
+read -rp "  GitHub repo name: " GITHUB_REPO
+read -rp "  Branch (default: main): " GITHUB_BRANCH
+GITHUB_BRANCH="${GITHUB_BRANCH:-main}"
+echo ""
 
 # ─────────────────────────────────────────
-# CONFIG
+# 3. Deploy method
 # ─────────────────────────────────────────
+echo -e "${YELLOW}── Deploy Method ─────────────────────────${RESET}"
+echo "  How should gitsub push to GitHub?"
+echo "  [1] Personal Access Token (HTTPS)  — easiest"
+echo "  [2] SSH Deploy Key                 — more secure, no token stored"
+echo ""
+read -rp "  Choose [1/2] (default: 1): " DEPLOY_CHOICE
+DEPLOY_CHOICE="${DEPLOY_CHOICE:-1}"
 
-class Config:
-    def __init__(self):
-        if not CONFIG_FILE.exists():
-            print(red("config.json not found. Run install.sh first."))
-            sys.exit(1)
-        with open(CONFIG_FILE) as f:
-            d = json.load(f)
-        self._raw = d
-        self.panel_url      = d["panel_url"].rstrip("/")
-        self.api_token      = d["api_token"]
-        self.github_user    = d["github_user"]
-        self.github_repo    = d["github_repo"]
-        self.github_branch  = d.get("github_branch", "main")
-        self.deploy_method  = d.get("deploy_method", "token")
-        self.github_token   = d.get("github_token", "")
-        self.ssh_key_path   = d.get("ssh_key_path", "/root/.ssh/gitsub_deploy")
-        self.filename_length= d.get("filename_length", 32)
-        self.sync_interval  = d.get("sync_interval", 21600)
-        self.ui_user        = d.get("ui_user", "admin")
-        self.ui_pass        = d.get("ui_pass", "")
-        self.ui_port        = d.get("ui_port", 2086)
-        self.timeout        = 20
-        self.retries        = 3
+DEPLOY_METHOD="token"
+GITHUB_TOKEN=""
+SSH_KEY_PATH="/root/.ssh/gitsub_deploy"
 
-    @property
-    def raw_base_url(self):
-        return f"https://raw.githubusercontent.com/{self.github_user}/{self.github_repo}/{self.github_branch}/subs"
+if [ "$DEPLOY_CHOICE" = "2" ]; then
+    DEPLOY_METHOD="ssh"
+    echo ""
+    echo -e "${YELLOW}── SSH Deploy Key ─────────────────────────${RESET}"
+    echo "  Do you already have an SSH key added to this repo?"
+    echo "  [1] Yes — I have a key already"
+    echo "  [2] No  — generate one for me"
+    echo ""
+    read -rp "  Choose [1/2] (default: 2): " HAS_KEY
+    HAS_KEY="${HAS_KEY:-2}"
 
+    if [ "$HAS_KEY" = "1" ]; then
+        echo "  How do you want to provide your existing key?"
+        echo "  [1] Give the file path  (e.g. /root/.ssh/id_rsa)"
+        echo "  [2] Paste the private key content now"
+        echo ""
+        read -rp "  Choose [1/2] (default: 1): " KEY_INPUT_METHOD
+        KEY_INPUT_METHOD="${KEY_INPUT_METHOD:-1}"
 
-def save_config(data: dict):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-    CONFIG_FILE.chmod(0o600)
+        if [ "$KEY_INPUT_METHOD" = "2" ]; then
+            info "Paste your private key below. Press Ctrl+D on an empty line when done."
+            echo ""
+            mkdir -p /root/.ssh && chmod 700 /root/.ssh
+            cat > "$SSH_KEY_PATH" << 'KEYEOF'
+KEYEOF
+            # Actually read pasted content
+            cat > "$SSH_KEY_PATH"
+            chmod 600 "$SSH_KEY_PATH"
+            # Derive public key from private key
+            ssh-keygen -y -f "$SSH_KEY_PATH" > "$SSH_KEY_PATH.pub" 2>/dev/null || true
+            success "Key stored at $SSH_KEY_PATH"
+        else
+            read -rp "  Path to private key (default: /root/.ssh/id_rsa): " SSH_KEY_PATH
+            SSH_KEY_PATH="${SSH_KEY_PATH:-/root/.ssh/id_rsa}"
+            [ ! -f "$SSH_KEY_PATH" ] && error "Key not found at $SSH_KEY_PATH"
+            chmod 600 "$SSH_KEY_PATH"
+            success "Using existing key: $SSH_KEY_PATH"
+        fi
+    else
+        info "Generating new ED25519 deploy key at $SSH_KEY_PATH ..."
+        mkdir -p /root/.ssh && chmod 700 /root/.ssh
+        # Remove old key if exists to avoid prompt
+        rm -f "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub"
+        ssh-keygen -t ed25519 -C "gitsub-deploy@$(hostname)" -f "$SSH_KEY_PATH" -N ""
+        success "Key generated: $SSH_KEY_PATH"
+    fi
 
+    # Write SSH config so git uses this specific key for github.com
+    SSH_CONFIG="/root/.ssh/config"
+    mkdir -p /root/.ssh && chmod 700 /root/.ssh
 
-# ─────────────────────────────────────────
-# UTILS
-# ─────────────────────────────────────────
+    # Remove old gitsub block if present
+    if grep -q "Host github-gitsub" "$SSH_CONFIG" 2>/dev/null; then
+        # Remove the old block (4 lines)
+        sed -i '/Host github-gitsub/,+4d' "$SSH_CONFIG"
+    fi
 
-ALPHABET = string.ascii_letters + string.digits
+    cat >> "$SSH_CONFIG" <<SSHEOF
 
-def gen_filename(n: int) -> str:
-    return "".join(secrets.choice(ALPHABET) for _ in range(n)) + ".txt"
+Host github-gitsub
+    HostName github.com
+    User git
+    IdentityFile $SSH_KEY_PATH
+    IdentitiesOnly yes
+    StrictHostKeyChecking no
+SSHEOF
+    chmod 600 "$SSH_CONFIG"
+    success "SSH config written: $SSH_CONFIG"
 
-def hash_content(links: list) -> str:
-    return hashlib.sha256("\n".join(links).encode()).hexdigest()
+    # Show the public key and link
+    echo ""
+    echo -e "${YELLOW}╔══ ACTION REQUIRED ═══════════════════════════════════╗${RESET}"
+    echo -e "${YELLOW}║  Add this public key to your GitHub repo              ║${RESET}"
+    echo -e "${YELLOW}║  → Settings → Deploy keys → Add deploy key            ║${RESET}"
+    echo -e "${YELLOW}║  → Check: Allow write access                          ║${RESET}"
+    echo -e "${YELLOW}╚══════════════════════════════════════════════════════╝${RESET}"
+    echo ""
+    echo -e "${CYAN}  Public key to paste:${RESET}"
+    echo "  ┌─────────────────────────────────────────────────────"
+    cat "$SSH_KEY_PATH.pub" | sed 's/^/  │ /'
+    echo "  └─────────────────────────────────────────────────────"
+    echo ""
+    echo -e "  ${CYAN}Click here to add it:${RESET}"
+    echo -e "  https://github.com/$GITHUB_USER/$GITHUB_REPO/settings/keys/new"
+    echo ""
+    read -rp "  Press ENTER after you've added the key to GitHub and enabled write access..."
 
-# ─────────────────────────────────────────
-# API
-# ─────────────────────────────────────────
+    # Test SSH using the alias (this is what git will use)
+    info "Testing SSH connection via github-gitsub alias..."
+    set +e
+    SSH_TEST=$(ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no -T git@github.com 2>&1)
+    SSH_OK=$?
+    set -e
+    if echo "$SSH_TEST" | grep -q "successfully authenticated"; then
+        success "SSH connection to GitHub: OK"
+    else
+        warn "SSH test output: $SSH_TEST"
+        warn "Could not confirm SSH. Make sure you added the key with write access, then continue."
+        read -rp "  Press ENTER to continue anyway, or Ctrl+C to abort..."
+    fi
 
-class API:
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
+else
+    echo ""
+    read -rp "  GitHub Personal Access Token (needs repo scope): " GITHUB_TOKEN
+fi
 
-    def _headers(self):
-        return {"Authorization": f"Bearer {self.cfg.api_token}"}
-
-    def _get(self, url: str):
-        last_err = None
-        for attempt in range(1, self.cfg.retries + 1):
-            try:
-                r = requests.get(url, headers=self._headers(), timeout=self.cfg.timeout)
-                r.raise_for_status()
-                return r.json()
-            except Exception as e:
-                last_err = e
-                log.warning(f"Attempt {attempt} failed for {url}: {e}")
-                time.sleep(2 * attempt)
-        raise RuntimeError(f"All {self.cfg.retries} retries failed: {last_err}")
-
-    def get_clients(self) -> list:
-        return self._get(f"{self.cfg.panel_url}/panel/api/clients/list").get("obj", [])
-
-    def get_sub_links(self, sub_id: str) -> list:
-        return self._get(f"{self.cfg.panel_url}/panel/api/clients/subLinks/{sub_id}").get("obj", [])
-
-
-# ─────────────────────────────────────────
-# STORE
-# ─────────────────────────────────────────
-
-class Store:
-    def load(self) -> dict:
-        if not SUBMAP_FILE.exists():
-            return {}
-        with open(SUBMAP_FILE) as f:
-            return json.load(f)
-
-    def save(self, data: dict):
-        with open(SUBMAP_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-
-    def write_sub(self, filename: str, links: list):
-        (SUBS_DIR / filename).write_text("\n".join(links))
-
-    def delete_sub(self, filename: str):
-        p = SUBS_DIR / filename
-        if p.exists():
-            p.unlink()
-            log.info(f"Deleted sub file: {filename}")
-
-
-# ─────────────────────────────────────────
-# GIT
-# ─────────────────────────────────────────
-
-class Git:
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-
-    def _run(self, args: list, check=True) -> subprocess.CompletedProcess:
-        result = subprocess.run(args, cwd=BASE_DIR, capture_output=True, text=True)
-        if check and result.returncode != 0:
-            raise RuntimeError(f"git {args[1]}: {result.stderr.strip()}")
-        return result
-
-    def _remote_url(self) -> str:
-        if self.cfg.deploy_method == "ssh":
-            # Use the SSH alias defined in ~/.ssh/config
-            return f"git@github-gitsub:{self.cfg.github_user}/{self.cfg.github_repo}.git"
-        return f"https://{self.cfg.github_token}@github.com/{self.cfg.github_user}/{self.cfg.github_repo}.git"
-
-    def _ensure_remote(self):
-        url = self._remote_url()
-        r = self._run(["git", "remote", "get-url", "origin"], check=False)
-        if r.returncode != 0:
-            self._run(["git", "remote", "add", "origin", url])
-        else:
-            self._run(["git", "remote", "set-url", "origin", url])
-
-    def pull_rebase(self):
-        """Fetch + rebase before push to handle diverged history."""
-        try:
-            self._run(["git", "fetch", "origin", self.cfg.github_branch])
-            result = self._run(
-                ["git", "rebase", f"origin/{self.cfg.github_branch}"], check=False
-            )
-            if result.returncode != 0:
-                # Abort rebase and try reset — for the subs-only repo this is safe
-                self._run(["git", "rebase", "--abort"], check=False)
-                self._run(["git", "reset", "--soft", f"origin/{self.cfg.github_branch}"], check=False)
-                log.warning("Rebase conflict resolved with reset")
-        except Exception as e:
-            log.warning(f"Pull/rebase skipped (may be new repo): {e}")
-
-    def push(self) -> bool:
-        self._ensure_remote()
-        self._run(["git", "add", "subs/"])
-        status = self._run(["git", "status", "--porcelain"], check=False)
-        if not status.stdout.strip():
-            log.info("Nothing to push")
-            return False
-        self.pull_rebase()
-        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-        self._run(["git", "commit", "-m", f"sync {ts}"])
-        url = self._remote_url()
-        result = subprocess.run(
-            ["git", "push", url, self.cfg.github_branch],
-            cwd=BASE_DIR, capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"Push failed: {result.stderr.strip()}")
-        log.info("Git push OK")
-        return True
-
+echo ""
 
 # ─────────────────────────────────────────
-# ENGINE
+# 4. Web UI
 # ─────────────────────────────────────────
+echo -e "${YELLOW}── Web Dashboard ─────────────────────────${RESET}"
+read -rp "  Enable web dashboard? [y/n] (default: y): " ENABLE_UI
+ENABLE_UI="${ENABLE_UI:-y}"
 
-class Engine:
-    def __init__(self):
-        self.cfg   = Config()
-        self.api   = API(self.cfg)
-        self.store = Store()
-        self.git   = Git(self.cfg)
+UI_PORT=2086
+ENABLE_NGINX="n"
+DOMAIN=""
+INSTALL_CERT="n"
+UI_USER=""
+UI_PASS=""
 
-    def sync(self):
-        log.info("─── Sync started ───")
-        submap  = self.store.load()
-        clients = self.api.get_clients()
-        log.info(f"Found {len(clients)} clients from panel")
+if [ "$ENABLE_UI" = "y" ]; then
+    read -rp "  Web UI port (default: 2086): " UI_PORT
+    UI_PORT="${UI_PORT:-2086}"
 
-        seen_ids = set()
-        new_map  = {}
+    echo ""
+    echo -e "${YELLOW}── Web UI Login ───────────────────────────${RESET}"
+    read -rp "  Dashboard username: " UI_USER
+    read -rsp "  Dashboard password: " UI_PASS
+    echo ""
 
-        for client in clients:
-            sub_id = client.get("subId", "").strip()
-            email  = client.get("email", "unknown")
-            if not sub_id:
-                continue
-            seen_ids.add(sub_id)
+    echo ""
+    echo -e "${YELLOW}── Nginx + Domain (optional) ─────────────${RESET}"
+    read -rp "  Set up Nginx reverse proxy with a domain? [y/n] (default: n): " ENABLE_NGINX
+    ENABLE_NGINX="${ENABLE_NGINX:-n}"
 
-            try:
-                links = self.api.get_sub_links(sub_id)
-            except Exception as e:
-                log.error(f"Failed links for {email}: {e}")
-                if sub_id in submap:
-                    new_map[sub_id] = submap[sub_id]
-                continue
+    if [ "$ENABLE_NGINX" = "y" ]; then
+        read -rp "  Domain name (e.g. sub.example.com): " DOMAIN
+        read -rp "  Also install SSL certificate with Certbot? [y/n] (default: y): " INSTALL_CERT
+        INSTALL_CERT="${INSTALL_CERT:-y}"
+    fi
+fi
 
-            if not links:
-                continue
-
-            old      = submap.get(sub_id)
-            filename = old["filename"] if old else gen_filename(self.cfg.filename_length)
-            old_hash = old.get("hash") if old else None
-            new_hash = hash_content(links)
-
-            if old_hash == new_hash:
-                new_map[sub_id] = old
-                continue
-
-            self.store.write_sub(filename, links)
-            new_map[sub_id] = {
-                "email":      email,
-                "filename":   filename,
-                "hash":       new_hash,
-                "raw_url":    f"{self.cfg.raw_base_url}/{filename}",
-                "updated":    int(time.time()),
-                "updated_ts": datetime.utcnow().isoformat(),
-            }
-            log.info(f"Updated: {email}")
-
-        for sub_id, v in submap.items():
-            if sub_id not in seen_ids:
-                self.store.delete_sub(v["filename"])
-                log.info(f"Removed: {v.get('email', sub_id)}")
-
-        self.store.save(new_map)
-
-        try:
-            self.git.push()
-        except Exception as e:
-            log.error(f"Git push failed: {e}")
-
-        log.info("─── Sync complete ───")
-        return new_map
-
-    def lookup(self, query: str):
-        q = query.strip().lower()
-        return [
-            (k, v) for k, v in self.store.load().items()
-            if q in v.get("email", "").lower() or q in k.lower()
-        ]
-
-    def rotate(self, query: str):
-        submap  = self.store.load()
-        q       = query.strip().lower()
-        rotated = []
-        for sub_id, v in submap.items():
-            if q in v.get("email", "").lower() or q in sub_id.lower():
-                old_path = SUBS_DIR / v["filename"]
-                new_file = gen_filename(Config().filename_length)
-                if old_path.exists():
-                    (SUBS_DIR / new_file).write_text(old_path.read_text())
-                    old_path.unlink()
-                v["filename"] = new_file
-                v["raw_url"]  = f"{Config().raw_base_url}/{new_file}"
-                v["hash"]     = ""
-                submap[sub_id] = v
-                rotated.append((sub_id, v))
-        if rotated:
-            self.store.save(submap)
-            Git(Config()).push()
-        return rotated
-
+echo ""
 
 # ─────────────────────────────────────────
-# SETTINGS MANAGER
+# 5. Sync interval
 # ─────────────────────────────────────────
+echo -e "${YELLOW}── Sync Interval ─────────────────────────${RESET}"
+echo "  How often to sync with the panel?"
+echo "  [1] 6 hours  (21600s) — recommended for production"
+echo "  [2] 1 hour   (3600s)"
+echo "  [3] 5 minutes (300s)  — good for testing"
+echo "  [4] Custom"
+echo ""
+read -rp "  Choose [1/2/3/4] (default: 1): " INTERVAL_CHOICE
+INTERVAL_CHOICE="${INTERVAL_CHOICE:-1}"
 
-SETTING_LABELS = {
-    "panel_url":       "Panel URL",
-    "api_token":       "API Token",
-    "github_user":     "GitHub Username",
-    "github_repo":     "GitHub Repo",
-    "github_branch":   "GitHub Branch",
-    "deploy_method":   "Deploy Method (token/ssh)",
-    "github_token":    "GitHub Personal Access Token",
-    "ssh_key_path":    "SSH Key Path",
-    "sync_interval":   "Sync Interval (seconds)",
-    "ui_port":         "Web UI Port",
-    "ui_user":         "Web UI Username",
-    "ui_pass":         "Web UI Password",
-    "filename_length": "Filename Length",
+case "$INTERVAL_CHOICE" in
+    1) INTERVAL=21600 ;;
+    2) INTERVAL=3600  ;;
+    3) INTERVAL=300   ;;
+    4) read -rp "  Enter interval in seconds: " INTERVAL ;;
+    *) INTERVAL=21600 ;;
+esac
+
+echo ""
+info "Summary:"
+echo "   Panel API URL : $PANEL_API_URL"
+echo "   GitHub repo : $GITHUB_USER/$GITHUB_REPO ($GITHUB_BRANCH)"
+echo "   Deploy via  : $DEPLOY_METHOD"
+echo "   Web UI      : $ENABLE_UI (port $UI_PORT)"
+[ -n "$DOMAIN" ] && echo "   Domain      : $DOMAIN"
+echo "   Sync every  : ${INTERVAL}s"
+echo ""
+read -rp "  Proceed with installation? [y/n] (default: y): " PROCEED
+PROCEED="${PROCEED:-y}"
+[ "$PROCEED" != "y" ] && echo "Aborted." && exit 0
+
+echo ""
+
+# ─────────────────────────────────────────
+# 6. System packages
+# ─────────────────────────────────────────
+info "Installing system packages..."
+apt-get update -qq
+PKGS="python3 python3-venv python3-pip git"
+[ "$ENABLE_NGINX" = "y" ] && PKGS="$PKGS nginx"
+[ "$INSTALL_CERT" = "y" ] && PKGS="$PKGS certbot python3-certbot-nginx"
+apt-get install -y $PKGS -qq
+success "Packages installed"
+
+# ─────────────────────────────────────────
+# 7. Copy project files
+# ─────────────────────────────────────────
+info "Setting up $INSTALL_DIR ..."
+mkdir -p "$INSTALL_DIR/subs" "$INSTALL_DIR/logs"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+for f in update.py webui.py requirements.txt uninstall.sh; do
+    [ -f "$SCRIPT_DIR/$f" ] && cp "$SCRIPT_DIR/$f" "$INSTALL_DIR/$f"
+done
+[ -d "$SCRIPT_DIR/subs" ] && cp -n "$SCRIPT_DIR/subs/"* "$INSTALL_DIR/subs/" 2>/dev/null || true
+success "Files copied to $INSTALL_DIR"
+
+# ─────────────────────────────────────────
+# 8. Python venv
+# ─────────────────────────────────────────
+info "Creating Python virtual environment..."
+python3 -m venv "$INSTALL_DIR/venv"
+"$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade pip
+"$INSTALL_DIR/venv/bin/pip" install --quiet -r "$INSTALL_DIR/requirements.txt"
+success "Python venv ready"
+
+# ─────────────────────────────────────────
+# 9. Git setup
+# ─────────────────────────────────────────
+info "Configuring git..."
+# Use GitHub username as git identity — no need to ask user separately
+git config --global user.email "${GITHUB_USER}@users.noreply.github.com"
+git config --global user.name "$GITHUB_USER"
+# Suppress branch name warning — always use the branch the user specified
+git config --global init.defaultBranch "$GITHUB_BRANCH"
+
+cd "$INSTALL_DIR"
+
+if [ ! -d .git ]; then
+    git init -q
+    git branch -M "$GITHUB_BRANCH" 2>/dev/null || true
+fi
+
+# Set remote URL
+if [ "$DEPLOY_METHOD" = "ssh" ]; then
+    REMOTE_URL="git@github-gitsub:$GITHUB_USER/$GITHUB_REPO.git"
+else
+    REMOTE_URL="https://${GITHUB_TOKEN}@github.com/$GITHUB_USER/$GITHUB_REPO.git"
+fi
+
+git remote remove origin 2>/dev/null || true
+git remote add origin "$REMOTE_URL"
+
+# .gitignore — keep secrets, runtime files, and OS junk out of repo
+cat > .gitignore <<'GITIGNORE'
+# gitsub secrets & runtime — NEVER push these
+config.json
+submap.json
+
+# Python
+venv/
+.venv/
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.env
+.env.*
+GITIGNORE
+
+# Try to sync with remote
+info "Connecting to GitHub..."
+set +e
+git fetch origin "$GITHUB_BRANCH" --quiet 2>/tmp/gitsub_fetch_err
+FETCH_OK=$?
+set -e
+
+if [ $FETCH_OK -eq 0 ]; then
+    git reset --hard "origin/$GITHUB_BRANCH" --quiet
+    success "Synced with remote repo"
+else
+    FETCH_ERR=$(cat /tmp/gitsub_fetch_err)
+    warn "Could not fetch from remote: $FETCH_ERR"
+    warn "This is OK for a new/empty repo — will push on first sync."
+    touch "$INSTALL_DIR/subs/.gitkeep"
+    git add subs/ 2>/dev/null || true
+fi
+
+success "Git configured"
+
+# ─────────────────────────────────────────
+# 10. Write config.json
+# ─────────────────────────────────────────
+info "Writing config.json..."
+cat > "$INSTALL_DIR/config.json" <<EOF
+{
+  "panel_api_url":  "$PANEL_API_URL",
+  "api_token":      "$API_TOKEN",
+
+  "github_user":    "$GITHUB_USER",
+  "github_repo":    "$GITHUB_REPO",
+  "github_branch":  "$GITHUB_BRANCH",
+
+  "deploy_method":  "$DEPLOY_METHOD",
+  "github_token":   "$GITHUB_TOKEN",
+  "ssh_key_path":   "$SSH_KEY_PATH",
+
+  "ui_user":        "$UI_USER",
+  "ui_pass":        "$UI_PASS",
+  "ui_port":        $UI_PORT,
+
+  "filename_length": 32,
+  "sync_interval":   $INTERVAL
 }
-
-def show_settings():
-    if not CONFIG_FILE.exists():
-        print(red("config.json not found."))
-        return
-    with open(CONFIG_FILE) as f:
-        cfg = json.load(f)
-    print(f"\n{bold('Current Settings')}  ({dim(str(CONFIG_FILE))})\n")
-    for i, (key, label) in enumerate(SETTING_LABELS.items(), 1):
-        val = cfg.get(key, dim("(not set)"))
-        # Mask passwords/tokens
-        if key in ("api_token", "github_token", "ui_pass") and val:
-            val = val[:4] + "●●●●●●●●" if len(str(val)) > 4 else "●●●●"
-        print(f"  {dim(str(i).rjust(2))}  {cyan(label):<38} {val}")
-    print()
-
-def edit_settings():
-    if not CONFIG_FILE.exists():
-        print(red("config.json not found."))
-        return
-    with open(CONFIG_FILE) as f:
-        cfg = json.load(f)
-
-    keys   = list(SETTING_LABELS.keys())
-    labels = list(SETTING_LABELS.values())
-
-    print(f"\n{bold('Edit Settings')} — which do you want to change?\n")
-    for i, label in enumerate(labels, 1):
-        key = keys[i-1]
-        val = cfg.get(key, "")
-        if key in ("api_token", "github_token", "ui_pass") and val:
-            val = val[:4] + "●●●"
-        print(f"  {cyan(str(i).rjust(2))}  {label:<38} {dim(str(val))}")
-
-    print(f"  {cyan('0')}  Cancel")
-    print()
-
-    raw = input("  Choose number: ").strip()
-    if not raw.isdigit() or int(raw) == 0 or int(raw) > len(keys):
-        print("Cancelled.")
-        return
-
-    idx = int(raw) - 1
-    key = keys[idx]
-    label = labels[idx]
-
-    current = cfg.get(key, "")
-    print(f"\n  Changing: {bold(label)}")
-    print(f"  Current:  {dim(str(current))}\n")
-
-    if key in ("api_token", "github_token", "ui_pass"):
-        import getpass
-        new_val = getpass.getpass(f"  New value (hidden): ")
-    else:
-        new_val = input(f"  New value: ").strip()
-
-    if not new_val:
-        print("  No change (empty input).")
-        return
-
-    # Type coerce for numeric fields
-    if key in ("sync_interval", "ui_port", "filename_length"):
-        try:
-            new_val = int(new_val)
-        except ValueError:
-            print(red("  Must be a number."))
-            return
-
-    cfg[key] = new_val
-    save_config(cfg)
-    print(green(f"\n  Saved. Restart services for changes to take effect."))
-
-    # Offer restart
-    print(f"\n  Restart services now?")
-    print(f"  {cyan('1')}  Restart both (sync + webui)")
-    print(f"  {cyan('2')}  Restart sync daemon only")
-    print(f"  {cyan('3')}  Restart web UI only")
-    print(f"  {cyan('0')}  No restart")
-    choice = input("\n  Choose: ").strip()
-    if choice == "1":
-        subprocess.run(["systemctl", "restart", "xui-subsync", "xui-webui"], check=False)
-        print(green("  Services restarted."))
-    elif choice == "2":
-        subprocess.run(["systemctl", "restart", "xui-subsync"], check=False)
-        print(green("  Sync daemon restarted."))
-    elif choice == "3":
-        subprocess.run(["systemctl", "restart", "xui-webui"], check=False)
-        print(green("  Web UI restarted."))
-
+EOF
+chmod 600 "$INSTALL_DIR/config.json"
+success "config.json written (chmod 600)"
 
 # ─────────────────────────────────────────
-# INTERACTIVE MENU
+# 11. gitsub CLI
 # ─────────────────────────────────────────
-
-def interactive_menu():
-    while True:
-        # Service status
-        def svc_status(name):
-            r = subprocess.run(
-                ["systemctl", "is-active", name],
-                capture_output=True, text=True
-            )
-            s = r.stdout.strip()
-            return green("● " + s) if s == "active" else dim("○ " + s)
-
-        sync_st = svc_status("xui-subsync")
-        ui_st   = svc_status("xui-webui")
-
-        print()
-        print(f"{bold('╔══════════════════════════════════════════╗')}")
-        print(f"{bold('║')}  {cyan('gitsub')} — XUI Subscription Sync           {bold('║')}")
-        print(f"{bold('╠══════════════════════════════════════════╣')}")
-        print(f"{bold('║')}  Services:  sync {sync_st:<28}{bold('║')}")
-        print(f"{bold('║')}             webui {ui_st:<26}{bold('║')}")
-        print(f"{bold('╠══════════════════════════════════════════╣')}")
-        print(f"{bold('║')}                                          {bold('║')}")
-        print(f"{bold('║')}  {cyan('1')}  Sync now (manual run)               {bold('║')}")
-        print(f"{bold('║')}  {cyan('2')}  Show all users & URLs               {bold('║')}")
-        print(f"{bold('║')}  {cyan('3')}  Lookup user by email / sub ID       {bold('║')}")
-        print(f"{bold('║')}  {cyan('4')}  Rotate user URL                     {bold('║')}")
-        print(f"{bold('║')}  {cyan('5')}  View logs (live)                    {bold('║')}")
-        print(f"{bold('║')}  {cyan('6')}  Settings — view & change            {bold('║')}")
-        print(f"{bold('║')}  {cyan('7')}  Restart services                    {bold('║')}")
-        print(f"{bold('║')}  {cyan('8')}  Service status details              {bold('║')}")
-        print(f"{bold('║')}  {cyan('0')}  Exit                                {bold('║')}")
-        print(f"{bold('║')}                                          {bold('║')}")
-        print(f"{bold('╚══════════════════════════════════════════╝')}")
-        print()
-
-        choice = input("  Choose [0-8]: ").strip()
-
-        if choice == "0":
-            break
-
-        elif choice == "1":
-            print()
-            try:
-                result = Engine().sync()
-                print(green(f"\n  Sync done — {len(result)} users."))
-            except Exception as e:
-                print(red(f"\n  Sync error: {e}"))
-            input("\n  Press ENTER to continue...")
-
-        elif choice == "2":
-            submap = Store().load()
-            if not submap:
-                print(yellow("\n  No users yet. Run a sync first."))
-            else:
-                print(f"\n  {bold('Users')}  ({len(submap)} total)\n")
-                print(f"  {'Email':<35} {'Raw URL'}")
-                print(f"  {'-'*35} {'-'*60}")
-                for sub_id, v in sorted(submap.items(), key=lambda x: x[1].get("email", "")):
-                    print(f"  {v.get('email', '?'):<35} {dim(v.get('raw_url', '—'))}")
-            input("\n  Press ENTER to continue...")
-
-        elif choice == "3":
-            q = input("\n  Email or sub ID to search: ").strip()
-            if q:
-                results = Engine().lookup(q)
-                if not results:
-                    print(yellow("  Not found."))
-                for sub_id, v in results:
-                    print(f"\n  Email   : {v.get('email')}")
-                    print(f"  Sub ID  : {sub_id}")
-                    print(f"  URL     : {cyan(v.get('raw_url', '—'))}")
-                    print(f"  Updated : {v.get('updated_ts', '—')}")
-            input("\n  Press ENTER to continue...")
-
-        elif choice == "4":
-            q = input("\n  Email or sub ID to rotate: ").strip()
-            if q:
-                confirm = input(f"  Rotate URL for '{q}'? This changes their link. [y/n]: ").strip()
-                if confirm == "y":
-                    results = Engine().rotate(q)
-                    if not results:
-                        print(yellow("  Not found."))
-                    for _, v in results:
-                        print(green(f"\n  Rotated: {v.get('email')} → {v.get('raw_url')}"))
-            input("\n  Press ENTER to continue...")
-
-        elif choice == "5":
-            print(f"\n  {dim('Press Ctrl+C to stop')}\n")
-            try:
-                subprocess.run(["tail", "-f", str(LOG_DIR / "sync.log")])
-            except KeyboardInterrupt:
-                pass
-
-        elif choice == "6":
-            print(f"\n  {cyan('a')}  View settings")
-            print(f"  {cyan('b')}  Edit a setting")
-            print(f"  {cyan('0')}  Back")
-            sub = input("\n  Choose: ").strip()
-            if sub == "a":
-                show_settings()
-                input("\n  Press ENTER to continue...")
-            elif sub == "b":
-                edit_settings()
-                input("\n  Press ENTER to continue...")
-
-        elif choice == "7":
-            print(f"\n  {cyan('1')}  Restart both")
-            print(f"  {cyan('2')}  Restart sync daemon")
-            print(f"  {cyan('3')}  Restart web UI")
-            print(f"  {cyan('0')}  Back")
-            sub = input("\n  Choose: ").strip()
-            if sub == "1":
-                subprocess.run(["systemctl", "restart", "xui-subsync", "xui-webui"], check=False)
-                print(green("  Restarted both services."))
-            elif sub == "2":
-                subprocess.run(["systemctl", "restart", "xui-subsync"], check=False)
-                print(green("  Sync daemon restarted."))
-            elif sub == "3":
-                subprocess.run(["systemctl", "restart", "xui-webui"], check=False)
-                print(green("  Web UI restarted."))
-            input("\n  Press ENTER to continue...")
-
-        elif choice == "8":
-            subprocess.run(["systemctl", "status", "xui-subsync", "xui-webui", "--no-pager"])
-            input("\n  Press ENTER to continue...")
-
-        else:
-            print(yellow("  Unknown choice."))
-
+info "Installing 'gitsub' CLI command..."
+cat > /usr/local/bin/gitsub <<EOF
+#!/bin/bash
+cd $INSTALL_DIR
+exec $INSTALL_DIR/venv/bin/python $INSTALL_DIR/update.py "\$@"
+EOF
+chmod +x /usr/local/bin/gitsub
+success "CLI ready — type 'gitsub' from anywhere"
 
 # ─────────────────────────────────────────
-# DAEMON
+# 12. Systemd — sync daemon
 # ─────────────────────────────────────────
+info "Creating systemd service: $SERVICE_SYNC ..."
+cat > "/etc/systemd/system/$SERVICE_SYNC.service" <<EOF
+[Unit]
+Description=gitsub XUI Subscription Sync Daemon
+After=network-online.target
+Wants=network-online.target
 
-def run_daemon(interval: int):
-    log.info(f"Daemon started — interval: {interval}s")
-    while True:
-        try:
-            Engine().sync()
-        except Exception as e:
-            log.error(f"Sync error: {e}")
-        log.info(f"Next sync in {interval}s")
-        time.sleep(interval)
+[Service]
+Type=simple
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/update.py daemon --interval $INTERVAL
+Restart=always
+RestartSec=30
+User=root
+StandardOutput=journal
+StandardError=journal
 
+[Install]
+WantedBy=multi-user.target
+EOF
 
 # ─────────────────────────────────────────
-# MAIN
+# 13. Systemd — web UI
 # ─────────────────────────────────────────
+if [ "$ENABLE_UI" = "y" ]; then
+    info "Creating systemd service: $SERVICE_UI ..."
+    cat > "/etc/systemd/system/$SERVICE_UI.service" <<EOF
+[Unit]
+Description=gitsub Web Dashboard
+After=network.target
 
-if __name__ == "__main__":
-    args = sys.argv[1:]
+[Service]
+Type=simple
+WorkingDirectory=$INSTALL_DIR
+Environment=PORT=$UI_PORT
+ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/webui.py
+Restart=always
+RestartSec=10
+User=root
+StandardOutput=journal
+StandardError=journal
 
-    # No args → interactive menu
-    if not args:
-        interactive_menu()
+[Install]
+WantedBy=multi-user.target
+EOF
+fi
 
-    elif args[0] == "sync":
-        Engine().sync()
+systemctl daemon-reload
+systemctl enable "$SERVICE_SYNC"
+systemctl start  "$SERVICE_SYNC"
 
-    elif args[0] == "daemon":
-        interval = 21600
-        if "--interval" in args:
-            idx = args.index("--interval")
-            interval = int(args[idx + 1])
-        run_daemon(interval)
+if [ "$ENABLE_UI" = "y" ]; then
+    systemctl enable "$SERVICE_UI"
+    systemctl start  "$SERVICE_UI"
+    # Open firewall port if ufw is active
+    if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
+        ufw allow "$UI_PORT/tcp" --comment "gitsub webui" >/dev/null 2>&1 || true
+        info "Firewall: opened port $UI_PORT"
+    fi
+fi
 
-    elif args[0] == "lookup":
-        if len(args) < 2:
-            print("Usage: gitsub lookup <email or subId>")
-            sys.exit(1)
-        for sub_id, v in Engine().lookup(args[1]):
-            print(f"\n  Email   : {v.get('email')}")
-            print(f"  Sub ID  : {sub_id}")
-            print(f"  URL     : {v.get('raw_url')}")
-            print(f"  Updated : {v.get('updated_ts', '—')}")
+success "Systemd services started"
 
-    elif args[0] == "rotate":
-        if len(args) < 2:
-            print("Usage: gitsub rotate <email or subId>")
-            sys.exit(1)
-        for _, v in Engine().rotate(args[1]):
-            print(f"  Rotated {v.get('email')} → {v.get('raw_url')}")
+# ─────────────────────────────────────────
+# 14. Nginx
+# ─────────────────────────────────────────
+if [ "$ENABLE_NGINX" = "y" ] && [ -n "$DOMAIN" ]; then
+    info "Configuring Nginx for $DOMAIN ..."
+    cat > "$NGINX_CONF" <<EOF
+server {
+    listen 80;
+    server_name $DOMAIN;
 
-    elif args[0] == "status":
-        submap = Store().load()
-        print(f"\n  Total users: {len(submap)}")
-        for sub_id, v in submap.items():
-            print(f"  • {v.get('email','?'):<35} {v.get('raw_url','—')}")
+    location / {
+        proxy_pass             http://127.0.0.1:$UI_PORT;
+        proxy_set_header       Host \$host;
+        proxy_set_header       X-Real-IP \$remote_addr;
+        proxy_set_header       X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header       X-Forwarded-Proto \$scheme;
+        proxy_read_timeout     60;
+        proxy_http_version     1.1;
+        proxy_set_header       Upgrade \$http_upgrade;
+        proxy_set_header       Connection keep-alive;
+    }
+}
+EOF
+    ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/xui-webui
+    nginx -t && systemctl reload nginx
+    success "Nginx configured for $DOMAIN"
 
-    elif args[0] == "settings":
-        if len(args) > 1 and args[1] == "edit":
-            edit_settings()
-        else:
-            show_settings()
+    # Open HTTP/HTTPS in firewall
+    if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
+        ufw allow 80/tcp  --comment "gitsub nginx" >/dev/null 2>&1 || true
+        ufw allow 443/tcp --comment "gitsub nginx ssl" >/dev/null 2>&1 || true
+    fi
 
-    elif args[0] == "webui":
-        os.execv(sys.executable, [sys.executable, str(BASE_DIR / "webui.py")])
+    if [ "$INSTALL_CERT" = "y" ]; then
+        info "Getting SSL certificate for $DOMAIN ..."
+        certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "admin@$DOMAIN" || \
+            warn "Certbot failed — you can run it manually: certbot --nginx -d $DOMAIN"
+        success "SSL certificate installed"
+    fi
+fi
 
-    elif args[0] in ("help", "--help", "-h"):
-        print(f"""
-{bold('gitsub')} — XUI Subscription Sync
+# ─────────────────────────────────────────
+# Done
+# ─────────────────────────────────────────
+SERVER_IP=$(hostname -I | awk '{print $1}')
 
-  {cyan('gitsub')}                      interactive menu
-  {cyan('gitsub sync')}                 sync now
-  {cyan('gitsub daemon')}               run as background daemon
-  {cyan('gitsub daemon --interval N')}  set interval to N seconds
-  {cyan('gitsub lookup')} <email|id>    find a user
-  {cyan('gitsub rotate')} <email|id>    rotate URL
-  {cyan('gitsub status')}               list all users
-  {cyan('gitsub settings')}             view settings
-  {cyan('gitsub settings edit')}        change a setting
-  {cyan('gitsub webui')}                start web dashboard
-  {cyan('gitsub help')}                 this help
-""")
+echo ""
+echo -e "${GREEN}╔══════════════════════════════════════════╗${RESET}"
+echo -e "${GREEN}║   Install complete!                       ║${RESET}"
+echo -e "${GREEN}╚══════════════════════════════════════════╝${RESET}"
+echo ""
+echo -e "  ${CYAN}Installed to:${RESET}   $INSTALL_DIR"
+echo ""
 
-    else:
-        print(f"Unknown command: {args[0]}\nRun 'gitsub help' for usage.")
-        sys.exit(1)
+if [ "$ENABLE_UI" = "y" ]; then
+    if [ "$ENABLE_NGINX" = "y" ] && [ -n "$DOMAIN" ]; then
+        PROTO="http"; [ "$INSTALL_CERT" = "y" ] && PROTO="https"
+        echo -e "  ${CYAN}Web UI:${RESET}   ${PROTO}://${DOMAIN}"
+    else
+        echo -e "  ${CYAN}Web UI:${RESET}   http://${SERVER_IP}:${UI_PORT}"
+    fi
+    echo ""
+fi
+
+echo "  Type 'gitsub' for the interactive menu."
+echo ""
