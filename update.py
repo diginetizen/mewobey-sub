@@ -53,6 +53,7 @@ class Config:
         self.github_token = d.get("github_token","")
         self.ssh_key_path = d.get("ssh_key_path","/root/.ssh/gitsub_deploy")
         self.filename_len = d.get("filename_length",32)
+        self.subs_dir     = d.get("subs_dir","subs")
         self.sync_interval= d.get("sync_interval",21600)
         self.ui_user      = d.get("ui_user","admin")
         self.ui_pass      = d.get("ui_pass","")
@@ -68,7 +69,7 @@ class Config:
 
     @property
     def raw_base_url(self):
-        return f"https://raw.githubusercontent.com/{self.github_user}/{self.github_repo}/{self.github_branch}/subs"
+        return f"https://raw.githubusercontent.com/{self.github_user}/{self.github_repo}/{self.github_branch}/{self.subs_dir}"
 
 def save_config(data: dict):
     with open(CONFIG_FILE,"w") as f: json.dump(data,f,indent=2)
@@ -104,14 +105,21 @@ class API:
 
 # ── Store ──────────────────────────────────────────────────────────────────
 class Store:
+    def __init__(self, cfg=None):
+        if cfg:
+            self._subs = BASE_DIR / cfg.subs_dir
+            self._subs.mkdir(exist_ok=True)
+        else:
+            self._subs = BASE_DIR / load_config().get("subs_dir","subs")
+            self._subs.mkdir(exist_ok=True)
     def load(self):
         if not SUBMAP_FILE.exists(): return {}
         with open(SUBMAP_FILE) as f: return json.load(f)
     def save(self, data):
         with open(SUBMAP_FILE,"w") as f: json.dump(data,f,indent=2)
-    def write_sub(self, fn, links): (SUBS_DIR/fn).write_text("\n".join(links))
+    def write_sub(self, fn, links): (self._subs/fn).write_text("\n".join(links))
     def delete_sub(self, fn):
-        p = SUBS_DIR/fn
+        p = self._subs/fn
         if p.exists(): p.unlink(); log.info(f"Deleted: {fn}")
 
 # ── Git ────────────────────────────────────────────────────────────────────
@@ -140,7 +148,8 @@ class Git:
         except Exception as e: log.warning(f"Rebase skipped: {e}")
     def push(self):
         self._ensure_remote()
-        self._run(["git","add","subs/"])
+        subs_dir = load_config().get("subs_dir","subs")
+        self._run(["git","add",f"{subs_dir}/"])
         if not self._run(["git","status","--porcelain"],check=False).stdout.strip():
             log.info("Nothing to push"); return False
         self.pull_rebase()
@@ -155,7 +164,7 @@ class Git:
 class Engine:
     def __init__(self):
         self.cfg=Config(); self.api=API(self.cfg)
-        self.store=Store(); self.git=Git(self.cfg)
+        self.store=Store(self.cfg); self.git=Git(self.cfg)
     def sync(self):
         log.info("─── Sync started ───")
         submap=self.store.load(); clients=self.api.get_clients()
@@ -175,10 +184,8 @@ class Engine:
             if old:
                 fn=old["filename"]
             else:
-                cfg_raw=load_config()
-                if cfg_raw.get("filename_mode")=="email" and email and email!="unknown":
-                    # sanitize email for use as filename
-                    safe=email.replace("@","_at_").replace(".","_").replace("/","_")
+                if self.cfg._raw.get("filename_mode")=="email" and email and email!="unknown":
+                    safe=email.replace("@","_at_").replace(".","_").replace("/","_").replace(" ","_")
                     fn=safe+".txt"
                 else:
                     fn=gen_filename(self.cfg.filename_len)
@@ -205,8 +212,8 @@ class Engine:
         submap=self.store.load(); q=q.strip().lower(); rotated=[]
         for sid,v in submap.items():
             if q in v.get("email","").lower() or q in sid.lower():
-                old=SUBS_DIR/v["filename"]; nf=gen_filename(Config().filename_len)
-                if old.exists(): (SUBS_DIR/nf).write_text(old.read_text()); old.unlink()
+                old=self.store._subs/v["filename"]; nf=gen_filename(self.cfg.filename_len)
+                if old.exists(): (self.store._subs/nf).write_text(old.read_text()); old.unlink()
                 v["filename"]=nf; v["raw_url"]=f"{Config().raw_base_url}/{nf}"; v["hash"]=""
                 submap[sid]=v; rotated.append((sid,v))
         if rotated: self.store.save(submap); Git(Config()).push()
@@ -234,9 +241,12 @@ SETTINGS = {
     "ssl_email":       "SSL Email (for Let's Encrypt)",
     "filename_length": "Filename Random Length",
     "filename_mode":   "Filename Mode (random / email)",
+    "subs_dir":        "Subs Folder Name in Repo",
+    "certbot_port":    "Certbot Challenge Port (default 80)",
 }
 NUMERIC = {"sync_interval","ui_port","filename_length"}
 FILENAME_MODES = {"random","email"}
+STR_SETTINGS = {"subs_dir","certbot_port","domain","access_mode","ssl_mode","ssl_cert","ssl_key","ssl_email"}
 SECRET  = {"api_token","github_token","ui_pass"}
 
 def show_settings():
@@ -574,9 +584,9 @@ def interactive_menu():
         print(_mrow("7", "Settings"))
         print(_mrow("8", "Enable SSL"))
         print(_mrow("9", "Restart services"))
-        print(_mrow("s", "Service status detail"))
-        print(_mrow("u", "Check for updates"))
-        print(_mrow("x", "Uninstall"))
+        print(_mrow("10", "Service status detail"))
+        print(_mrow("11", "Check for updates"))
+        print(_mrow("12", "Uninstall"))
         print(_mrow("0", "Exit"))
         print(_blank())
         print(_bot())
@@ -634,11 +644,12 @@ def interactive_menu():
                 print(yellow("\n  No subs yet."))
             else:
                 cfg = Config()
-                print(f"\n  {bold('File Map')}  ({len(submap)} files in {SUBS_DIR})\n")
+                sdir = BASE_DIR / cfg.subs_dir
+                print(f"\n  {bold('File Map')}  ({len(submap)} files in {sdir})\n")
                 print(f"  {'Email':<28}  {'OK'}  {'File':<34}  Updated")
                 print(f"  {'-'*28}  {'--'}  {'-'*34}  {'-'*16}")
                 for _,v in sorted(submap.items(), key=lambda x: x[1].get("email","")):
-                    fp = SUBS_DIR/v.get("filename","")
+                    fp = sdir/v.get("filename","")
                     ok = green("✓") if fp.exists() else red("✗")
                     ts = (v.get("updated_ts") or "—")[:16]
                     print(f"  {v.get('email','?'):<28}  {ok}   {v.get('filename','?'):<34}  {dim(ts)}")
@@ -670,15 +681,15 @@ def interactive_menu():
             elif sub=="3": subprocess.run(["systemctl","restart","xui-webui"],check=False); print(green("  Web UI restarted."))
             input("\n  ENTER to continue...")
 
-        elif choice == "s":
+        elif choice == "10":
             subprocess.run(["systemctl","status","xui-subsync","xui-webui","--no-pager"])
             input("\n  ENTER to continue...")
 
-        elif choice == "u":
+        elif choice == "11":
             self_update_interactive()
             input("\n  ENTER to continue...")
 
-        elif choice == "x":
+        elif choice == "12":
             print(f"\n  {red('Uninstall gitsub?')} This will remove all services and files.")
             confirm = input("  Type 'yes' to confirm: ").strip().lower()
             if confirm == "yes":
