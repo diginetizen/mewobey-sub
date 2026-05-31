@@ -169,7 +169,16 @@ class Engine:
                 continue
             if not links: continue
             old=submap.get(sub_id)
-            fn=old["filename"] if old else gen_filename(self.cfg.filename_len)
+            if old:
+                fn=old["filename"]
+            else:
+                cfg_raw=load_config()
+                if cfg_raw.get("filename_mode")=="email" and email and email!="unknown":
+                    # sanitize email for use as filename
+                    safe=email.replace("@","_at_").replace(".","_").replace("/","_")
+                    fn=safe+".txt"
+                else:
+                    fn=gen_filename(self.cfg.filename_len)
             nh=hash_content(links)
             if old and old.get("hash")==nh: new_map[sub_id]=old; continue
             self.store.write_sub(fn,links)
@@ -218,8 +227,10 @@ SETTINGS = {
     "ssl_key":         "SSL Key Path",
     "ssl_domain":      "SSL Domain",
     "filename_length": "Filename Random Length",
+    "filename_mode":   "Filename Mode (random / email)",
 }
 NUMERIC = {"sync_interval","ui_port","filename_length"}
+FILENAME_MODES = {"random","email"}
 SECRET  = {"api_token","github_token","ui_pass"}
 
 def show_settings():
@@ -348,7 +359,10 @@ def check_for_updates():
             remote=r2.json()["sha"][:8] if r2.status_code==200 else None
         if not remote: return {"available":False,"error":"Cannot reach GitHub"}
         lf=BASE_DIR/"version.txt"
-        local=lf.read_text().strip() if lf.exists() else "unknown"
+        local=lf.read_text().strip() if lf.exists() else None
+        # If no local version file, we can't compare — treat as updatable
+        if not local:
+            return {"available":True,"local":"not installed","remote":remote}
         return {"available":remote!=local,"local":local,"remote":remote}
     except Exception as e:
         return {"available":False,"error":str(e)}
@@ -570,16 +584,19 @@ def interactive_menu():
             input("\n  ENTER to continue...")
 
         elif choice == "x":
-            print(f"\n  {red('Uninstall gitsub?')}")
-            if input("  Type YES to confirm: ").strip() == "YES":
+            print(f"\n  {red('Uninstall gitsub?')} This will remove all services and files.")
+            confirm = input("  Type 'yes' to confirm: ").strip().lower()
+            if confirm == "yes":
                 uninstall_path = BASE_DIR/"uninstall.sh"
                 if uninstall_path.exists():
                     subprocess.run(["bash",str(uninstall_path)])
                 else:
                     print(red("  uninstall.sh not found."))
+                print(green("\n  Uninstall complete. Exiting."))
+                sys.exit(0)
             else:
                 print("  Cancelled.")
-            input("\n  ENTER to continue...")
+                input("\n  ENTER to continue...")
 
         else:
             print(yellow("  Unknown choice."))
