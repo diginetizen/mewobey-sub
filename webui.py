@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """gitsub WebUI — Dashboard with settings, mobile-friendly"""
 
-import os, sys, json, secrets, subprocess, threading
+import os, sys, json, secrets, subprocess, threading, time
 from pathlib import Path
 from datetime import datetime
 from functools import wraps
@@ -80,17 +80,72 @@ def trigger_sync():
 def svc_status(name) -> dict:
     r = subprocess.run(["systemctl","is-active",name], capture_output=True, text=True)
     active = r.stdout.strip() == "active"
-    r2= subprocess.run(["systemctl","show",name,"--no-page","--property=ActiveState,SubState,ActiveEnterTimestamp"],
-                        capture_output=True, text=True)
-    props={}
+    r2 = subprocess.run(
+        ["systemctl","show",name,"--no-page",
+         "--property=ActiveState,SubState,ActiveEnterTimestamp,ExecMainPID,MemoryCurrent"],
+        capture_output=True, text=True)
+    props = {}
     for line in r2.stdout.strip().splitlines():
-        if "=" in line: k,v=line.split("=",1); props[k]=v
+        if "=" in line: k,v = line.split("=",1); props[k] = v
+    # Get memory in MB if available
+    mem = props.get("MemoryCurrent","")
+    try:    mem_mb = f"{int(mem)/1024/1024:.1f} MB"
+    except: mem_mb = "—"
     return {
         "name":   name,
         "active": active,
         "state":  r.stdout.strip(),
         "since":  props.get("ActiveEnterTimestamp","").replace("n/a","").strip() or "—",
+        "pid":    props.get("ExecMainPID","—"),
+        "memory": mem_mb,
     }
+
+def sync_info() -> dict:
+    """Return current sync mode, interval, last/next sync times."""
+    cfg    = load_cfg()
+    submap = load_submap()
+    interval = int(cfg.get("sync_interval", 21600))
+
+    # Find last sync time from submap
+    last_ts = max((v.get("updated",0) for v in submap.values()), default=0)
+
+    # Check if daemon is running
+    r = subprocess.run(["systemctl","is-active","xui-subsync"], capture_output=True, text=True)
+    daemon_active = r.stdout.strip() == "active"
+
+    mode = "daemon (auto)" if daemon_active else "manual only"
+
+    # Next sync = last_ts + interval (only meaningful if daemon running)
+    next_ts = (last_ts + interval) if (daemon_active and last_ts) else None
+
+    # Time until next sync
+    now = int(time.time())
+    if next_ts and next_ts > now:
+        remaining = next_ts - now
+        h, m = divmod(remaining // 60, 60)
+        countdown = f"{h}h {m}m" if h else f"{m}m {remaining%60}s"
+    elif daemon_active and last_ts:
+        countdown = "syncing soon"
+    else:
+        countdown = "—"
+
+    return {
+        "mode":          mode,
+        "daemon_active": daemon_active,
+        "interval":      interval,
+        "interval_fmt":  _fmt_interval(interval),
+        "last_sync":     fmtts(last_ts) if last_ts else "never",
+        "last_ts":       last_ts,
+        "next_sync":     fmtts(next_ts) if next_ts else "—",
+        "countdown":     countdown,
+        "syncing_now":   _syncing,
+    }
+
+def _fmt_interval(s):
+    s = int(s)
+    if s >= 3600: return f"{s//3600}h {(s%3600)//60}m" if s%3600 else f"{s//3600}h"
+    if s >= 60:   return f"{s//60}m"
+    return f"{s}s"
 
 # ── HTML ───────────────────────────────────────────────────────────────────
 LOGIN_HTML = """<!DOCTYPE html><html lang="en">
@@ -315,6 +370,43 @@ tbody td{padding:10px 16px;font-family:var(--mono);font-size:12px;vertical-align
 
 <!-- SERVICES TAB -->
 <div class="panel" id="tab-services">
+  <!-- Sync status panel -->
+  <div id="sync-panel" style="padding:16px 20px;border-bottom:1px solid var(--brd);background:var(--surf)">
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+      <div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Sync Daemon</div>
+        <div id="sync-mode-badge" style="font-family:var(--mono);font-size:14px;font-weight:600">—</div>
+        <div id="sync-next" style="font-family:var(--mono);font-size:11px;color:var(--mut);margin-top:4px"></div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <div style="font-family:var(--mono);font-size:11px;color:var(--mut)">Interval:</div>
+        <input id="interval-input" type="number" min="60"
+               style="width:90px;background:var(--bg);border:1px solid var(--brd);color:var(--txt);
+                      font-family:var(--mono);font-size:12px;padding:6px 8px;border-radius:4px;outline:none">
+        <span style="font-family:var(--mono);font-size:11px;color:var(--mut)">seconds</span>
+        <button class="pill" onclick="saveInterval()">Apply</button>
+        <button class="pill primary" onclick="doSync()">⟳ Sync Now</button>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:1px;background:var(--brd);margin-top:14px;border-radius:4px;overflow:hidden">
+      <div style="background:var(--bg);padding:10px 14px">
+        <div style="font-family:var(--mono);font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:1px;margin-bottom:3px">Last sync</div>
+        <div id="si-last" style="font-family:var(--mono);font-size:12px">—</div>
+      </div>
+      <div style="background:var(--bg);padding:10px 14px">
+        <div style="font-family:var(--mono);font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:1px;margin-bottom:3px">Next sync</div>
+        <div id="si-next" style="font-family:var(--mono);font-size:12px">—</div>
+      </div>
+      <div style="background:var(--bg);padding:10px 14px">
+        <div style="font-family:var(--mono);font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:1px;margin-bottom:3px">Interval</div>
+        <div id="si-interval" style="font-family:var(--mono);font-size:12px">—</div>
+      </div>
+      <div style="background:var(--bg);padding:10px 14px">
+        <div style="font-family:var(--mono);font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:1px;margin-bottom:3px">Status now</div>
+        <div id="si-now" style="font-family:var(--mono);font-size:12px">—</div>
+      </div>
+    </div>
+  </div>
   <div class="svc-grid" id="svc-grid">
     <div class="empty"><h3>Loading…</h3></div>
   </div>
@@ -434,7 +526,41 @@ async function rotate(sub_id,email){
 }
 
 // ── Services ──────────────────────────────────
+async function loadSyncInfo(){
+  const r=await fetch('/api/sync/info');
+  if(r.status===401){location='/login';return;}
+  const d=await r.json();
+  const badge=document.getElementById('sync-mode-badge');
+  const inp=document.getElementById('interval-input');
+  badge.textContent=d.daemon_active?'● Auto (daemon running)':'○ Manual only';
+  badge.style.color=d.daemon_active?'var(--acc)':'var(--warn)';
+  document.getElementById('sync-next').textContent=
+    d.daemon_active?(d.syncing_now?'Syncing now…':'Next in: '+d.countdown):'Daemon not running — syncs are manual only';
+  document.getElementById('si-last').textContent=d.last_sync||'never';
+  document.getElementById('si-next').textContent=d.daemon_active?d.next_sync:'—';
+  document.getElementById('si-interval').textContent=d.interval_fmt+' ('+d.interval+'s)';
+  document.getElementById('si-now').textContent=d.syncing_now?'🔄 Syncing…':'Idle';
+  if(inp&&!inp.dataset.dirty) inp.value=d.interval;
+}
+
+async function saveInterval(){
+  const val=parseInt(document.getElementById('interval-input').value);
+  if(!val||val<60){toast('Minimum 60 seconds','err');return;}
+  const r=await fetch('/api/settings',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({key:'sync_interval',value:String(val)})});
+  const d=await r.json();
+  if(d.ok){
+    toast('Interval saved. Restarting sync daemon…');
+    await fetch('/api/service',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'restart',name:'xui-subsync'})});
+    setTimeout(loadSyncInfo,2000);
+  } else toast(d.msg||'Save failed','err');
+}
+
 async function loadServices(){
+  loadSyncInfo();
   const r=await fetch('/api/services');
   if(r.status===401){location='/login';return;}
   const d=await r.json();
@@ -476,14 +602,18 @@ const SETTINGS_GROUPS = [
     {k:'ssh_key_path',  label:'SSH Key Path', type:'text'},
   ]},
   {title:'Sync', fields:[
-    {k:'sync_interval',  label:'Sync Interval (seconds)',        type:'number', note:'Requires service restart'},
-    {k:'filename_length',label:'Filename Random Length',          type:'number'},
-    {k:'filename_mode',  label:'Filename Mode',                   type:'text',   note:'random  or  email'},
+    {k:'sync_interval', label:'Sync Interval (seconds)', type:'number', note:'Or change live in the Services tab'},
   ]},
   {title:'Web UI', fields:[
     {k:'ui_port', label:'Port',     type:'number', note:'Requires service restart'},
     {k:'ui_user', label:'Username', type:'text'},
     {k:'ui_pass', label:'Password', type:'password'},
+    {k:'certbot_port', label:'Certbot challenge port', type:'text', note:'Port used when requesting Let\'s Encrypt cert (default 80)'},
+  ]},
+  {title:'Subscriptions', fields:[
+    {k:'subs_dir',      label:'Subs folder name in repo', type:'text', note:'Folder where .txt files are stored (e.g. subs)'},
+    {k:'filename_mode', label:'Filename mode',             type:'text', note:'random — secure random string   |   email — user email as filename'},
+    {k:'filename_length',label:'Random filename length',  type:'number'},
   ]},
   {title:'Access & Domain', fields:[
     {k:'access_mode', label:'Access Mode', type:'text',
@@ -577,6 +707,12 @@ def api_sync():
 @app.route("/api/sync/status")
 @login_required
 def api_sync_status(): return jsonify({"running":_syncing})
+@app.route("/api/sync/info")
+@login_required
+def api_sync_info():
+    return jsonify(sync_info())
+
+
 
 @app.route("/api/rotate", methods=["POST"])
 @login_required
@@ -611,7 +747,7 @@ def api_service():
 EDITABLE = {"panel_api_url","api_token","github_user","github_repo","github_branch",
             "deploy_method","github_token","ssh_key_path","sync_interval","ui_port",
             "ui_user","ui_pass","filename_length","filename_mode",
-            "domain","access_mode","ssl_mode","ssl_cert","ssl_key","ssl_email"}
+            "domain","access_mode","ssl_mode","ssl_cert","ssl_key","ssl_email","subs_dir","certbot_port"}
 NUMERIC  = {"sync_interval","ui_port","filename_length"}
 
 @app.route("/api/settings")
