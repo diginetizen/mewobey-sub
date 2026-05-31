@@ -57,9 +57,12 @@ class Config:
         self.ui_user      = d.get("ui_user","admin")
         self.ui_pass      = d.get("ui_pass","")
         self.ui_port      = d.get("ui_port",2086)
+        self.domain       = d.get("domain","")
+        self.access_mode  = d.get("access_mode","1")
+        self.ssl_mode     = d.get("ssl_mode","none")
         self.ssl_cert     = d.get("ssl_cert","")
         self.ssl_key      = d.get("ssl_key","")
-        self.ssl_domain   = d.get("ssl_domain","")
+        self.ssl_email    = d.get("ssl_email","")
         self.timeout      = 20
         self.retries      = 3
 
@@ -223,9 +226,12 @@ SETTINGS = {
     "ui_port":         "Web UI Port",
     "ui_user":         "Web UI Username",
     "ui_pass":         "Web UI Password",
-    "ssl_cert":        "SSL Certificate Path",
-    "ssl_key":         "SSL Key Path",
-    "ssl_domain":      "SSL Domain",
+    "domain":          "Domain Name",
+    "access_mode":     "Access Mode (1=IP / 2=IP+domain / 3=+HTTPS / 4=IP+HTTPS)",
+    "ssl_mode":        "SSL Mode (none / certbot / manual / later)",
+    "ssl_cert":        "SSL Certificate Path (fullchain.pem)",
+    "ssl_key":         "SSL Key Path (privkey.pem)",
+    "ssl_email":       "SSL Email (for Let's Encrypt)",
     "filename_length": "Filename Random Length",
     "filename_mode":   "Filename Mode (random / email)",
 }
@@ -272,9 +278,10 @@ def edit_settings():
 def _offer_restart(changed_key=""):
     # Decide which services are affected
     if changed_key in ("sync_interval","panel_api_url","api_token","github_user","github_repo",
-                        "github_branch","deploy_method","github_token","ssh_key_path"):
+                        "github_branch","deploy_method","github_token","ssh_key_path","filename_mode"):
         suggestion = "1"  # sync daemon
-    elif changed_key in ("ui_port","ui_user","ui_pass","ssl_cert","ssl_key"):
+    elif changed_key in ("ui_port","ui_user","ui_pass","ssl_cert","ssl_key",
+                         "domain","access_mode","ssl_mode","ssl_email"):
         suggestion = "3"  # webui
     else:
         suggestion = "1"
@@ -286,32 +293,17 @@ def _offer_restart(changed_key=""):
     elif c=="3": subprocess.run(["systemctl","restart","xui-webui"],check=False); print(green("  Web UI restarted."))
 
 # ── SSL setup from menu ─────────────────────────────────────────────────────
-def setup_ssl_menu():
-    cfg = load_config()
-    print(f"\n{bold('Enable SSL')}\n")
-    print(f"  {cyan('1')}  Use Certbot (needs domain + nginx)")
-    print(f"  {cyan('2')}  Use existing cert files")
-    print(f"  {cyan('0')}  Back\n")
-    c = input("  Choose: ").strip()
-    if c=="0": return
-    if c=="1":
-        domain = input("  Domain (e.g. sub.example.com): ").strip()
-        email  = input(f"  Email for notices [{cfg.get('github_user','admin')}@{domain}]: ").strip()
-        email  = email or f"{cfg.get('github_user','admin')}@{domain}"
-        if not domain: print(red("  Domain required.")); return
-        port   = cfg.get("ui_port",2086)
-        # Install nginx if needed
-        if subprocess.run(["which","nginx"],capture_output=True).returncode != 0:
-            info = "Installing nginx + certbot..."
-            subprocess.run(["apt-get","install","-y","-qq","nginx","certbot","python3-certbot-nginx"],check=False)
-        # Write nginx config (no port 80 conflict — only runs on 80 for certbot challenge then redirects)
-        nginx_conf="/etc/nginx/sites-available/xui-webui"
-        conflicts=subprocess.run(["grep","-rl",f"server_name.*{domain}","/etc/nginx/sites-enabled/"],
-                                  capture_output=True,text=True).stdout.strip()
-        if conflicts:
-            for f in conflicts.split("\n"):
-                if f and "xui-webui" not in f: subprocess.run(["rm","-f",f])
-        conf_content = f"""server {{
+def _write_nginx_conf(domain, port):
+    """Write nginx config that proxies domain:80 → localhost:port. No SSL."""
+    import os
+    nginx_conf = "/etc/nginx/sites-available/xui-webui"
+    # Remove conflicting configs
+    r = subprocess.run(["grep","-rl",f"server_name.*{domain}","/etc/nginx/sites-enabled/"],
+                        capture_output=True,text=True)
+    for f in r.stdout.strip().splitlines():
+        if f and "xui-webui" not in f:
+            subprocess.run(["rm","-f",f],check=False)
+    conf = f"""server {{
     listen 80;
     server_name {domain};
     location / {{
@@ -325,26 +317,129 @@ def setup_ssl_menu():
         proxy_buffering      off;
     }}
 }}"""
-        Path(nginx_conf).write_text(conf_content)
-        os.makedirs("/etc/nginx/sites-enabled",exist_ok=True)
-        os.symlink(nginx_conf,"/etc/nginx/sites-enabled/xui-webui") if not Path("/etc/nginx/sites-enabled/xui-webui").exists() else None
-        subprocess.run(["nginx","-t","-q"],check=False)
-        subprocess.run(["systemctl","reload","nginx"],check=False)
-        # Run certbot
-        r = subprocess.run(["certbot","--nginx","-d",domain,"--non-interactive","--agree-tos","-m",email])
-        if r.returncode==0:
-            print(green(f"\n  SSL live at https://{domain}"))
-            cfg["ssl_domain"]=domain; save_config(cfg)
-        else:
-            print(red("  Certbot failed — check domain DNS and try again."))
-    elif c=="2":
-        cert=input("  Path to certificate (fullchain.pem): ").strip()
-        key =input("  Path to private key (privkey.pem): ").strip()
-        if not Path(cert).exists() or not Path(key).exists():
-            print(red("  File not found.")); return
-        cfg["ssl_cert"]=cert; cfg["ssl_key"]=key; save_config(cfg)
-        print(green("  Cert paths saved. Restarting web UI..."))
+    Path(nginx_conf).write_text(conf)
+    os.makedirs("/etc/nginx/sites-enabled",exist_ok=True)
+    link = Path("/etc/nginx/sites-enabled/xui-webui")
+    if not link.exists(): link.symlink_to(nginx_conf)
+    subprocess.run(["nginx","-t","-q"],check=False)
+    subprocess.run(["systemctl","reload","nginx"],check=False)
+
+
+def setup_ssl_menu():
+    cfg = load_config()
+    port = cfg.get("ui_port",2086)
+
+    print(f"\n{bold('Access / SSL Setup')}\n")
+    print(f"  Current mode : {cyan(cfg.get('access_mode','1'))} — {cfg.get('domain','no domain')}")
+    print()
+    print(f"  {cyan('1')}  IP only           http://IP:{port}")
+    print(f"  {cyan('2')}  IP + domain HTTP  http://IP:{port}  +  http://domain:{port}")
+    print(f"  {cyan('3')}  IP + domain + HTTPS  (adds https://domain on port 443)")
+    print(f"  {cyan('4')}  IP + HTTPS via cert  https://IP:{port}")
+    print(f"  {cyan('0')}  Back\n")
+    choice = input("  Choose: ").strip()
+    if choice == "0": return
+
+    if choice == "1":
+        cfg["access_mode"]="1"; cfg["domain"]=""; cfg["ssl_mode"]="none"
+        save_config(cfg)
         subprocess.run(["systemctl","restart","xui-webui"],check=False)
+        print(green(f"\n  Done. Access: http://SERVER_IP:{port}"))
+        return
+
+    if choice in ("2","3"):
+        domain = input("  Domain name: ").strip()
+        if not domain: print(red("  Domain required.")); return
+        cfg["domain"] = domain; cfg["access_mode"] = choice
+
+        # Install nginx
+        if subprocess.run(["which","nginx"],capture_output=True).returncode != 0:
+            print("  Installing nginx...")
+            subprocess.run(["apt-get","install","-y","-qq","nginx"],check=False)
+
+        _write_nginx_conf(domain, port)
+        print(green(f"  Nginx: {domain} → port {port}"))
+
+        if choice == "2":
+            cfg["ssl_mode"]="none"; save_config(cfg)
+            print(green(f"\n  Done. Access:\n    http://SERVER_IP:{port}\n    http://{domain}:{port}"))
+            return
+
+        # choice == "3" — add HTTPS
+        print()
+        print(f"  SSL source:")
+        print(f"  {cyan('1')}  Certbot / Let's Encrypt (auto)")
+        print(f"  {cyan('2')}  I have cert files")
+        print(f"  {cyan('3')}  Skip SSL for now\n")
+        ssl_src = input("  Choose: ").strip()
+
+        if ssl_src == "1":
+            # Install certbot if needed
+            if subprocess.run(["which","certbot"],capture_output=True).returncode != 0:
+                subprocess.run(["apt-get","install","-y","-qq","certbot","python3-certbot-nginx"],check=False)
+            email = input(f"  Email [{cfg.get('github_user','admin')}@{domain}]: ").strip()
+            email = email or f"{cfg.get('github_user','admin')}@{domain}"
+            r = subprocess.run(["certbot","--nginx","-d",domain,"--non-interactive","--agree-tos","-m",email])
+            if r.returncode==0:
+                cfg["ssl_mode"]="certbot"; cfg["ssl_email"]=email; save_config(cfg)
+                print(green(f"\n  Done. Access:\n    http://SERVER_IP:{port}\n    http://{domain}:{port}\n    https://{domain}"))
+            else:
+                print(red("  Certbot failed. Check DNS and try again."))
+        elif ssl_src == "2":
+            cert = input("  Path to certificate (fullchain.pem): ").strip()
+            key  = input("  Path to private key  (privkey.pem): ").strip()
+            if not Path(cert).exists() or not Path(key).exists():
+                print(red("  File not found.")); return
+            # Append SSL block to nginx config
+            nginx_conf = "/etc/nginx/sites-available/xui-webui"
+            extra = f"""
+server {{
+    listen 443 ssl;
+    server_name {domain};
+    ssl_certificate     {cert};
+    ssl_certificate_key {key};
+    location / {{
+        proxy_pass           http://127.0.0.1:{port};
+        proxy_set_header     Host $host;
+        proxy_set_header     X-Forwarded-Proto https;
+        proxy_read_timeout   60;
+    }}
+}}"""
+            with open(nginx_conf,"a") as f: f.write(extra)
+            subprocess.run(["nginx","-t","-q"],check=False)
+            subprocess.run(["systemctl","reload","nginx"],check=False)
+            cfg["ssl_mode"]="manual"; cfg["ssl_cert"]=cert; cfg["ssl_key"]=key; save_config(cfg)
+            print(green(f"\n  Done. Access:\n    http://SERVER_IP:{port}\n    http://{domain}:{port}\n    https://{domain}"))
+        else:
+            cfg["ssl_mode"]="later"; save_config(cfg)
+            print(yellow("  SSL skipped. Run this menu again to add it later."))
+        return
+
+    if choice == "4":
+        print()
+        print(f"  {cyan('1')}  Enter cert file paths")
+        print(f"  {cyan('2')}  Paste cert content\n")
+        src = input("  Choose: ").strip()
+        cert_dir = BASE_DIR/"ssl"; cert_dir.mkdir(exist_ok=True)
+
+        if src == "2":
+            cert = str(cert_dir/"cert.pem"); key = str(cert_dir/"key.pem")
+            print("  Paste certificate (fullchain.pem), Ctrl+D when done:")
+            import sys as _sys
+            Path(cert).write_text(_sys.stdin.read())
+            print("  Paste private key (privkey.pem), Ctrl+D when done:")
+            Path(key).write_text(_sys.stdin.read())
+            Path(key).chmod(0o600)
+        else:
+            cert = input("  Certificate path: ").strip()
+            key  = input("  Key path: ").strip()
+            if not Path(cert).exists() or not Path(key).exists():
+                print(red("  File not found.")); return
+
+        cfg["access_mode"]="4"; cfg["ssl_mode"]="manual"
+        cfg["ssl_cert"]=cert; cfg["ssl_key"]=key; save_config(cfg)
+        subprocess.run(["systemctl","restart","xui-webui"],check=False)
+        print(green(f"\n  Done. Access: https://SERVER_IP:{port}"))
 
 # ── Self update ────────────────────────────────────────────────────────────
 GITHUB_RAW   = "https://raw.githubusercontent.com/diginetizen/mewobey-sub/main"
