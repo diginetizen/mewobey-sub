@@ -478,12 +478,21 @@ const SETTINGS_GROUPS = [
   {title:'Sync', fields:[
     {k:'sync_interval',  label:'Sync Interval (seconds)',        type:'number', note:'Requires service restart'},
     {k:'filename_length',label:'Filename Random Length',          type:'number'},
-    {k:'filename_mode',  label:'Filename Mode (random or email)', type:'text',   note:'Use email name or random string for sub file'},
+    {k:'filename_mode',  label:'Filename Mode',                   type:'text',   note:'random  or  email'},
   ]},
   {title:'Web UI', fields:[
     {k:'ui_port', label:'Port',     type:'number', note:'Requires service restart'},
     {k:'ui_user', label:'Username', type:'text'},
     {k:'ui_pass', label:'Password', type:'password'},
+  ]},
+  {title:'Access & Domain', fields:[
+    {k:'access_mode', label:'Access Mode', type:'text',
+     note:'1=IP only  2=IP+domain HTTP  3=IP+domain+HTTPS  4=IP+HTTPS'},
+    {k:'domain',      label:'Domain Name', type:'text',   note:'e.g. sub.example.com (used for modes 2 and 3)'},
+    {k:'ssl_mode',    label:'SSL Mode',    type:'text',   note:'none / certbot / manual / later'},
+    {k:'ssl_cert',    label:'SSL Cert Path (fullchain.pem)', type:'text'},
+    {k:'ssl_key',     label:'SSL Key Path (privkey.pem)',    type:'text'},
+    {k:'ssl_email',   label:'SSL Email (Let\'s Encrypt)',    type:'text'},
   ]},
 
 ];
@@ -601,7 +610,8 @@ def api_service():
 
 EDITABLE = {"panel_api_url","api_token","github_user","github_repo","github_branch",
             "deploy_method","github_token","ssh_key_path","sync_interval","ui_port",
-            "ui_user","ui_pass","filename_length","filename_mode"}
+            "ui_user","ui_pass","filename_length","filename_mode",
+            "domain","access_mode","ssl_mode","ssl_cert","ssl_key","ssl_email"}
 NUMERIC  = {"sync_interval","ui_port","filename_length"}
 
 @app.route("/api/settings")
