@@ -5,6 +5,29 @@
 # ══════════════════════════════════════════════
 set -e
 
+# Show * for each character typed — for passwords and tokens
+masked_input() {
+    local prompt="$1"
+    local result=""
+    local char
+    printf "%s" "$prompt" >&2
+    while IFS= read -r -s -n1 char; do
+        if [[ -z "$char" ]]; then
+            break
+        elif [[ "$char" == $'\x7f' || "$char" == $'\b' ]]; then
+            if [[ -n "$result" ]]; then
+                result="${result%?}"
+                printf '\b \b' >&2
+            fi
+        else
+            result+="$char"
+            printf '*' >&2
+        fi
+    done
+    printf '\n' >&2
+    printf '%s' "$result"
+}
+
 INSTALL_DIR="/opt/xui-subsync"
 SERVICE_SYNC="xui-subsync"
 SERVICE_UI="xui-webui"
