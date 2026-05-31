@@ -31,8 +31,7 @@ echo "  Examples:  https://panel.example.com:2053"
 echo "             http://1.2.3.4:54321"
 echo ""
 read -rp "  Panel API base URL: " PANEL_API_URL
-read -rsp "  API Bearer Token: " API_TOKEN
-echo ""
+API_TOKEN=$(masked_input "  API Bearer Token: ")
 echo ""
 
 # ── 2. GitHub ──────────────────────────────────
@@ -150,8 +149,7 @@ SSHEOF
     echo ""
 
 else
-    read -rsp "  GitHub Personal Access Token (repo scope): " GITHUB_TOKEN
-    echo ""
+    GITHUB_TOKEN=$(masked_input "  GitHub Personal Access Token (repo scope): ")
     echo ""
 fi
 
@@ -176,8 +174,7 @@ if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
     echo -e "${YELLOW}── Login Credentials ─────────────────────${RESET}"
     read -rp "  Dashboard username [admin]: " UI_USER
     UI_USER="${UI_USER:-admin}"
-    read -rsp "  Dashboard password: " UI_PASS
-    echo ""
+    UI_PASS=$(masked_input "  Dashboard password: ")
     echo ""
 
     echo -e "${YELLOW}── SSL (optional) ────────────────────────${RESET}"
@@ -340,6 +337,7 @@ cat > "$INSTALL_DIR/config.json" <<EOF
   "ssl_key":        "$SSL_KEY",
 
   "filename_length": 32,
+  "filename_mode":   "random",
   "sync_interval":   $INTERVAL
 }
 EOF
@@ -474,24 +472,18 @@ SERVER_IP=$(hostname -I | awk '{print $1}')
 
 echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════╗${RESET}"
-echo -e "${GREEN}║   Install complete!                       ║${RESET}"
+echo -e "${GREEN}║   Install complete!                      ║${RESET}"
 echo -e "${GREEN}╚══════════════════════════════════════════╝${RESET}"
 echo ""
 echo -e "  ${CYAN}Installed to:${RESET}  $INSTALL_DIR"
 echo ""
 
 if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
-    echo -e "  ${CYAN}Web UI:${RESET}"
-    if [ "$HAS_SSL" = "certbot" ] && [ -n "$SSL_DOMAIN" ]; then
-        echo "    https://$SSL_DOMAIN        (HTTPS via Certbot)"
-        echo "    http://${SERVER_IP}:${UI_PORT}   (direct, HTTP)"
-    elif [ "$HAS_SSL" = "manual" ]; then
-        echo "    https://${SERVER_IP}:${UI_PORT}   (HTTPS, manual cert)"
-    else
-        echo "    http://${SERVER_IP}:${UI_PORT}    (HTTP)"
-    fi
+    echo -e "  ${CYAN}Web UI access:${RESET}"
+    echo -e "    http://${SERVER_IP}:${UI_PORT}"
+    [ -n "$SSL_DOMAIN" ] && echo -e "    http://${SSL_DOMAIN}:${UI_PORT}    (domain)"
     echo ""
 fi
 
-echo "  Type ${CYAN}gitsub${RESET} for the interactive menu."
+echo -e "  Type ${CYAN}gitsub${RESET} for the interactive menu."
 echo ""
