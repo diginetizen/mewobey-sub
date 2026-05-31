@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """gitsub WebUI — Dashboard with settings, mobile-friendly"""
 
-import os, sys, json, secrets, subprocess, threading, ssl
+import os, sys, json, secrets, subprocess, threading
 from pathlib import Path
 from datetime import datetime
 from functools import wraps
@@ -55,7 +55,9 @@ def login_required(f):
     @wraps(f)
     def dec(*a, **kw):
         if not session.get("ok"):
-            return jsonify({"error":"unauthorized"}),401 if request.path.startswith("/api/") else redirect("/login")
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "unauthorized"}), 401
+            return redirect("/login")
         return f(*a, **kw)
     return dec
 
@@ -474,19 +476,16 @@ const SETTINGS_GROUPS = [
     {k:'ssh_key_path',  label:'SSH Key Path', type:'text'},
   ]},
   {title:'Sync', fields:[
-    {k:'sync_interval',  label:'Sync Interval (seconds)', type:'number', note:'Requires service restart'},
-    {k:'filename_length',label:'Filename Length',         type:'number'},
+    {k:'sync_interval',  label:'Sync Interval (seconds)',        type:'number', note:'Requires service restart'},
+    {k:'filename_length',label:'Filename Random Length',          type:'number'},
+    {k:'filename_mode',  label:'Filename Mode (random or email)', type:'text',   note:'Use email name or random string for sub file'},
   ]},
   {title:'Web UI', fields:[
     {k:'ui_port', label:'Port',     type:'number', note:'Requires service restart'},
     {k:'ui_user', label:'Username', type:'text'},
     {k:'ui_pass', label:'Password', type:'password'},
   ]},
-  {title:'SSL', fields:[
-    {k:'ssl_cert',   label:'Certificate Path (fullchain.pem)', type:'text'},
-    {k:'ssl_key',    label:'Key Path (privkey.pem)',           type:'text'},
-    {k:'ssl_domain', label:'Domain',                           type:'text'},
-  ]},
+
 ];
 
 async function loadSettings(){
@@ -562,7 +561,9 @@ def api_data():
 @app.route("/api/sync", methods=["POST"])
 @login_required
 def api_sync():
-    return jsonify({"ok":True}) if trigger_sync() else jsonify({"ok":False,"msg":"Already running"}),409
+    if trigger_sync():
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "msg": "Already running"}), 409
 
 @app.route("/api/sync/status")
 @login_required
@@ -600,7 +601,7 @@ def api_service():
 
 EDITABLE = {"panel_api_url","api_token","github_user","github_repo","github_branch",
             "deploy_method","github_token","ssh_key_path","sync_interval","ui_port",
-            "ui_user","ui_pass","ssl_cert","ssl_key","ssl_domain","filename_length"}
+            "ui_user","ui_pass","filename_length","filename_mode"}
 NUMERIC  = {"sync_interval","ui_port","filename_length"}
 
 @app.route("/api/settings")
@@ -628,15 +629,5 @@ def api_settings_save():
 
 # ── Run ────────────────────────────────────────────────────────────────────
 if __name__=="__main__":
-    cfg=load_cfg()
-    cert=cfg.get("ssl_cert",""); key=cfg.get("ssl_key","")
-
-    print(f"  gitsub WebUI → port {PORT}")
-    if cert and key and Path(cert).exists() and Path(key).exists():
-        print(f"  SSL: enabled ({cert})")
-        ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain(cert, key)
-        app.run(host="0.0.0.0", port=PORT, debug=False, ssl_context=ctx)
-    else:
-        if cert or key: print(f"  SSL: cert/key path not found — running HTTP")
-        app.run(host="0.0.0.0", port=PORT, debug=False)
+    print(f"  gitsub WebUI → http://0.0.0.0:{PORT}")
+    app.run(host="0.0.0.0", port=PORT, debug=False)
