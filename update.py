@@ -378,9 +378,9 @@ def setup_ssl_menu():
         # choice == "3" — add HTTPS
         print()
         print(f"  SSL source:")
-        print(f"  {cyan('1')}  Certbot / Let's Encrypt (auto)")
-        print(f"  {cyan('2')}  I have cert files")
-        print(f"  {cyan('3')}  Skip SSL for now\n")
+        print(f"  {cyan(' 1')}  Certbot / Let's Encrypt (auto)")
+        print(f"  {cyan(' 2')}  I have cert files on this server")
+        print(f"  {cyan(' 3')}  Skip — I will add SSL later\n")
         ssl_src = input("  Choose: ").strip()
 
         if ssl_src == "1":
@@ -427,8 +427,8 @@ server {{
 
     if choice == "4":
         print()
-        print(f"  {cyan('1')}  Enter cert file paths")
-        print(f"  {cyan('2')}  Paste cert content\n")
+        print(f"  {cyan(' 1')}  Enter the file paths")
+        print(f"  {cyan(' 2')}  Paste the certificate content\n")
         src = input("  Choose: ").strip()
         cert_dir = BASE_DIR/"ssl"; cert_dir.mkdir(exist_ok=True)
 
@@ -510,7 +510,9 @@ def self_update_interactive():
     print(f"\n  {yellow('Update available!')}")
     print(f"  Current : {dim(info.get('local','?'))}")
     print(f"  Latest  : {cyan(info.get('remote','?'))}\n")
-    if input("  Install now? [y/n]: ").strip().lower() != "y":
+    print(f"  {cyan(' 1')}  Install update now")
+    print(f"  {cyan(' 0')}  Cancel\n")
+    if input("  Choose: ").strip() != "1":
         print("  Cancelled."); return
     print("  Downloading...")
     ok, changed = do_self_update()
@@ -518,7 +520,9 @@ def self_update_interactive():
     print(green(f"\n  Updated: {', '.join(changed)}"))
     if ok:
         print(f"\n  {yellow('Restart needed.')}")
-        if input("  Restart now? [y/n]: ").strip().lower() == "y":
+        print(f"  {cyan(' 1')}  Restart now")
+        print(f"  {cyan(' 0')}  Skip\n")
+        if input("  Choose: ").strip() == "1":
             subprocess.run(["systemctl","restart","xui-subsync","xui-webui"],check=False)
             print(green("  Restarted."))
 
@@ -548,7 +552,9 @@ def _top():   return f"{B}╔{'═'*W}╗{RS}"
 def _bot():   return f"{B}╚{'═'*W}╝{RS}"
 
 def _mrow(key, label):
-    content = f"  {cyan(key)}  {label}"
+    # Pad key to 2 visible chars so single and double digits align
+    key_padded = key.rjust(2)
+    content = f"  {cyan(key_padded)}  {label}"
     return _box_line(content)
 
 def _srow(prefix, colored_val, vlen_val):
@@ -592,7 +598,7 @@ def interactive_menu():
         print(_bot())
         print()
 
-        choice = input("  Choose: ").strip().lower()
+        choice = input("  Choose: ").strip()
 
         if choice == "0":
             break
@@ -662,19 +668,22 @@ def interactive_menu():
             except KeyboardInterrupt: pass
 
         elif choice == "7":
-            print(f"\n  {cyan('a')}  View all settings")
-            print(f"  {cyan('b')}  Edit a setting")
-            print(f"  {cyan('0')}  Back")
+            print(f"\n  {cyan(' 1')}  View all settings")
+            print(f"  {cyan(' 2')}  Edit a setting")
+            print(f"  {cyan(' 0')}  Back")
             sub=input("\n  Choose: ").strip()
-            if sub=="a": show_settings(); input("\n  ENTER to continue...")
-            elif sub=="b": edit_settings(); input("\n  ENTER to continue...")
+            if sub=="1": show_settings(); input("\n  ENTER to continue...")
+            elif sub=="2": edit_settings(); input("\n  ENTER to continue...")
 
         elif choice == "8":
             setup_ssl_menu()
             input("\n  ENTER to continue...")
 
         elif choice == "9":
-            print(f"\n  {cyan('1')}  Both   {cyan('2')}  Sync   {cyan('3')}  Web UI   {cyan('0')}  Back")
+            print(f"\n  {cyan(' 1')}  Restart both services")
+            print(f"  {cyan(' 2')}  Restart sync daemon only")
+            print(f"  {cyan(' 3')}  Restart web UI only")
+            print(f"  {cyan(' 0')}  Back")
             sub=input("\n  Choose: ").strip()
             if sub=="1": subprocess.run(["systemctl","restart","xui-subsync","xui-webui"],check=False); print(green("  Restarted both."))
             elif sub=="2": subprocess.run(["systemctl","restart","xui-subsync"],check=False); print(green("  Sync restarted."))
@@ -691,8 +700,8 @@ def interactive_menu():
 
         elif choice == "12":
             print(f"\n  {red('Uninstall gitsub?')} This will remove all services and files.")
-            confirm = input("  Type 'yes' to confirm: ").strip().lower()
-            if confirm == "yes":
+            confirm = input("  Are you sure? [y/n]: ").strip().lower()
+            if confirm in ("y","yes"):
                 uninstall_path = BASE_DIR/"uninstall.sh"
                 if uninstall_path.exists():
                     subprocess.run(["bash",str(uninstall_path)])
