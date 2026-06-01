@@ -294,6 +294,11 @@ tbody td{padding:10px 16px;font-family:var(--mono);font-size:12px;vertical-align
 .set-save:hover{background:var(--acc);color:#0d0f12}
 .set-note{font-size:10px;color:var(--mut);margin-top:3px}
 
+/* Hide number input spinners */
+input[type=number]::-webkit-inner-spin-button,
+input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+input[type=number]{-moz-appearance:textfield}
+
 /* Sync dot */
 .dot{width:7px;height:7px;border-radius:50%;background:var(--mut);display:inline-block;margin-right:5px}
 .dot.on{background:var(--warn);animation:pulse 1s infinite}
@@ -356,7 +361,8 @@ tbody td{padding:10px 16px;font-family:var(--mono);font-size:12px;vertical-align
       <input id="q" type="text" placeholder="filter by email or sub ID…" oninput="filter()">
     </div>
     <span class="cnt" id="cnt"></span>
-    <button class="pill" onclick="copyAll()">copy all URLs</button>
+    <button class="pill" id="sort-btn" onclick="toggleSort()">↕ sort: A–Z</button>
+    <button class="pill" onclick="copyAll()">copy all</button>
   </div>
   <div class="tbl-wrap">
     <table>
@@ -422,7 +428,7 @@ tbody td{padding:10px 16px;font-family:var(--mono);font-size:12px;vertical-align
 <div class="toast" id="toast"></div>
 
 <script>
-let rows=[], pollTimer;
+let rows=[], pollTimer, sortDir='asc';
 
 // ── Tabs ──────────────────────────────────────
 function showTab(id, btn) {
@@ -450,7 +456,11 @@ async function loadData(){
   const r=await fetch('/api/data');
   if(r.status===401){location='/login';return;}
   const d=await r.json();
-  rows=d.entries; render(rows);
+  rows=d.entries;
+  rows.sort((a,b)=> sortDir==='asc'
+    ? (a.email||'').localeCompare(b.email||'')
+    : (b.email||'').localeCompare(a.email||''));
+  render(rows);
   document.getElementById('s-tot').textContent=d.total;
   document.getElementById('s-repo').textContent=d.repo||'—';
   document.getElementById('s-sync').textContent=d.last_sync||'—';
@@ -477,6 +487,15 @@ function render(data){
       <td style="color:var(--mut);font-size:11px">${esc(r.updated)}</td>
       <td><button class="rot" onclick="rotate('${esc(r.sub_id)}','${esc(r.email)}')">rotate</button></td>
     </tr>`).join('');
+}
+
+function toggleSort(){
+  sortDir = sortDir==='asc' ? 'desc' : 'asc';
+  document.getElementById('sort-btn').textContent = sortDir==='asc' ? '↕ sort: A–Z' : '↕ sort: Z–A';
+  rows.sort((a,b)=> sortDir==='asc'
+    ? (a.email||'').localeCompare(b.email||'')
+    : (b.email||'').localeCompare(a.email||''));
+  filter();
 }
 
 function filter(){
@@ -608,21 +627,15 @@ const SETTINGS_GROUPS = [
     {k:'ui_port', label:'Port',     type:'number', note:'Requires service restart'},
     {k:'ui_user', label:'Username', type:'text'},
     {k:'ui_pass', label:'Password', type:'password'},
-    {k:'certbot_port', label:'Certbot challenge port', type:'text', note:'Port used when requesting Let\'s Encrypt cert (default 80)'},
   ]},
   {title:'Subscriptions', fields:[
     {k:'subs_dir',      label:'Subs folder name in repo', type:'text', note:'Folder where .txt files are stored (e.g. subs)'},
     {k:'filename_mode', label:'Filename mode',             type:'text', note:'random — secure random string   |   email — user email as filename'},
     {k:'filename_length',label:'Random filename length',  type:'number'},
   ]},
-  {title:'Access & Domain', fields:[
-    {k:'access_mode', label:'Access Mode', type:'text',
-     note:'1=IP only  2=IP+domain HTTP  3=IP+domain+HTTPS  4=IP+HTTPS'},
-    {k:'domain',      label:'Domain Name', type:'text',   note:'e.g. sub.example.com (used for modes 2 and 3)'},
-    {k:'ssl_mode',    label:'SSL Mode',    type:'text',   note:'none / certbot / manual / later'},
-    {k:'ssl_cert',    label:'SSL Cert Path (fullchain.pem)', type:'text'},
-    {k:'ssl_key',     label:'SSL Key Path (privkey.pem)',    type:'text'},
-    {k:'ssl_email',   label:'SSL Email (Let\'s Encrypt)',    type:'text'},
+  {title:'Nginx & Domain', fields:[
+    {k:'access_mode', label:'Access Mode', type:'text', note:'1 = IP only   2 = domain via nginx'},
+    {k:'domain',      label:'Domain Name', type:'text', note:'e.g. sub.example.com  —  must point to this server IP'},
   ]},
 
 ];
@@ -747,7 +760,7 @@ def api_service():
 EDITABLE = {"panel_api_url","api_token","github_user","github_repo","github_branch",
             "deploy_method","github_token","ssh_key_path","sync_interval","ui_port",
             "ui_user","ui_pass","filename_length","filename_mode",
-            "domain","access_mode","ssl_mode","ssl_cert","ssl_key","ssl_email","subs_dir","certbot_port"}
+            "domain","access_mode","subs_dir","filename_mode","filename_length"}
 NUMERIC  = {"sync_interval","ui_port","filename_length"}
 
 @app.route("/api/settings")
