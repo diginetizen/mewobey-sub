@@ -5,7 +5,7 @@ import os, sys, json, secrets, subprocess, threading, time
 from pathlib import Path
 from datetime import datetime
 from functools import wraps
-from flask import Flask, jsonify, request, redirect, session, Response
+from flask import Flask, jsonify, request, redirect, session
 
 BASE_DIR    = Path(__file__).resolve().parent
 SUBMAP_FILE = BASE_DIR / "submap.json"
@@ -14,7 +14,6 @@ CONFIG_FILE = BASE_DIR / "config.json"
 app  = Flask(__name__)
 PORT = int(os.getenv("PORT", 2086))
 
-# ── Config ─────────────────────────────────────────────────────────────────
 def load_cfg() -> dict:
     if not CONFIG_FILE.exists(): return {}
     with open(CONFIG_FILE) as f: return json.load(f)
@@ -36,19 +35,17 @@ def get_or_create_secret() -> str:
     if cfg.get("flask_secret"): return cfg["flask_secret"]
     s = secrets.token_hex(32); cfg["flask_secret"]=s; save_cfg(cfg); return s
 
-# Flask config
 app.secret_key = get_or_create_secret()
 app.config.update(SESSION_COOKIE_SECURE=False, SESSION_COOKIE_HTTPONLY=True,
                    SESSION_COOKIE_SAMESITE="Lax")
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1, x_for=1)
 
-# ── Auth ───────────────────────────────────────────────────────────────────
 def check_auth(u, p) -> bool:
     cfg = load_cfg()
     eu  = cfg.get("ui_user","admin")
     ep  = cfg.get("ui_pass","")
-    if not ep: return True  # no password set = open
+    if not ep: return True
     return u==eu and p==ep
 
 def login_required(f):
@@ -61,7 +58,6 @@ def login_required(f):
         return f(*a, **kw)
     return dec
 
-# ── Sync state ─────────────────────────────────────────────────────────────
 _syncing = False
 _sync_lock = threading.Lock()
 
@@ -76,7 +72,6 @@ def trigger_sync():
         finally: _syncing = False
     threading.Thread(target=_r,daemon=True).start(); return True
 
-# ── Service status ─────────────────────────────────────────────────────────
 def svc_status(name) -> dict:
     r = subprocess.run(["systemctl","is-active",name], capture_output=True, text=True)
     active = r.stdout.strip() == "active"
@@ -87,7 +82,6 @@ def svc_status(name) -> dict:
     props = {}
     for line in r2.stdout.strip().splitlines():
         if "=" in line: k,v = line.split("=",1); props[k] = v
-    # Get memory in MB if available
     mem = props.get("MemoryCurrent","")
     try:    mem_mb = f"{int(mem)/1024/1024:.1f} MB"
     except: mem_mb = "—"
@@ -101,24 +95,13 @@ def svc_status(name) -> dict:
     }
 
 def sync_info() -> dict:
-    """Return current sync mode, interval, last/next sync times."""
     cfg    = load_cfg()
     submap = load_submap()
     interval = int(cfg.get("sync_interval", 21600))
-
-    # Find last sync time from submap
     last_ts = max((v.get("updated",0) for v in submap.values()), default=0)
-
-    # Check if daemon is running
     r = subprocess.run(["systemctl","is-active","xui-subsync"], capture_output=True, text=True)
     daemon_active = r.stdout.strip() == "active"
-
-    mode = "daemon (auto)" if daemon_active else "manual only"
-
-    # Next sync = last_ts + interval (only meaningful if daemon running)
     next_ts = (last_ts + interval) if (daemon_active and last_ts) else None
-
-    # Time until next sync
     now = int(time.time())
     if next_ts and next_ts > now:
         remaining = next_ts - now
@@ -128,9 +111,8 @@ def sync_info() -> dict:
         countdown = "syncing soon"
     else:
         countdown = "—"
-
     return {
-        "mode":          mode,
+        "mode":          "daemon (auto)" if daemon_active else "manual only",
         "daemon_active": daemon_active,
         "interval":      interval,
         "interval_fmt":  _fmt_interval(interval),
@@ -147,538 +129,1053 @@ def _fmt_interval(s):
     if s >= 60:   return f"{s//60}m"
     return f"{s}s"
 
-# ── HTML ───────────────────────────────────────────────────────────────────
-LOGIN_HTML = """<!DOCTYPE html><html lang="en">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>gitsub login</title>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:#0d0f12;color:#c8d0e0;font-family:'IBM Plex Mono',monospace;
-     min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}
-.box{background:#14171d;border:1px solid #1e2330;border-radius:8px;padding:36px 32px;width:100%;max-width:340px}
-.logo{color:#00d4aa;font-size:20px;font-weight:600;margin-bottom:28px;text-align:center}
-.logo span{color:#545e72;font-weight:400}
-label{display:block;font-size:10px;color:#545e72;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}
-input{width:100%;background:#0d0f12;border:1px solid #1e2330;color:#c8d0e0;
-      font-family:'IBM Plex Mono',monospace;font-size:13px;padding:9px 12px;
-      border-radius:4px;outline:none;transition:border-color .15s;margin-bottom:18px}
-input:focus{border-color:#00d4aa}
-button{width:100%;background:#00d4aa;border:none;color:#0d0f12;
-       font-family:'IBM Plex Mono',monospace;font-size:13px;font-weight:600;
-       padding:11px;border-radius:4px;cursor:pointer;transition:opacity .15s}
-button:hover{opacity:.85}
-.err{color:#ff4d6d;font-size:12px;margin-bottom:14px;text-align:center}
-</style></head>
-<body><div class="box">
-<div class="logo">git<span>/</span>sub</div>
-{error}
-<form method="POST" action="/login">
-  <label>Username</label><input type="text" name="username" autocomplete="username" autofocus>
-  <label>Password</label><input type="password" name="password" autocomplete="current-password">
-  <button type="submit">Sign in</button>
-</form>
-</div></body></html>"""
 
-DASH_HTML = r"""<!DOCTYPE html>
+# ────────────────────────────────────────────────────────────────────────────
+# HTML
+# ────────────────────────────────────────────────────────────────────────────
+
+LOGIN_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>gitsub</title>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
-:root{
-  --bg:#0d0f12;--surf:#14171d;--brd:#1e2330;
-  --acc:#00d4aa;--acc2:#007aff;--warn:#ff9f43;--err:#ff4d6d;
-  --txt:#c8d0e0;--mut:#545e72;
-  --mono:'IBM Plex Mono',monospace;--sans:'IBM Plex Sans',sans-serif;
-}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--txt);font-family:var(--sans);font-size:14px;min-height:100vh}
+:root{
+  --bg:#080b10;--card:#0f1318;--brd:#1a2030;
+  --acc:#3ECFCF;--txt:#dde3ee;--sub:#5a6478;
+  --err:#f05;--font-mono:'DM Mono',monospace;--font-sans:'DM Sans',sans-serif;
+}
+body{
+  background:var(--bg);color:var(--txt);font-family:var(--font-sans);
+  min-height:100vh;display:flex;align-items:center;justify-content:center;
+  padding:20px;
+}
+/* Subtle grid background */
+body::before{
+  content:'';position:fixed;inset:0;
+  background-image:linear-gradient(var(--brd) 1px,transparent 1px),
+                   linear-gradient(90deg,var(--brd) 1px,transparent 1px);
+  background-size:40px 40px;opacity:.35;pointer-events:none;z-index:0;
+}
+.card{
+  position:relative;z-index:1;
+  background:var(--card);border:1px solid var(--brd);
+  border-radius:12px;padding:40px 36px;width:100%;max-width:360px;
+  box-shadow:0 24px 64px rgba(0,0,0,.6);
+}
+.brand{
+  display:flex;align-items:center;gap:10px;margin-bottom:32px;
+}
+.brand-icon{
+  width:36px;height:36px;background:var(--acc);border-radius:8px;
+  display:flex;align-items:center;justify-content:center;
+  font-family:var(--font-mono);font-size:14px;font-weight:500;color:#080b10;
+  flex-shrink:0;
+}
+.brand-name{font-family:var(--font-mono);font-size:18px;font-weight:500;color:var(--txt)}
+.brand-name span{color:var(--sub)}
+.field{margin-bottom:18px}
+label{
+  display:block;font-size:11px;font-weight:500;letter-spacing:.06em;
+  color:var(--sub);text-transform:uppercase;margin-bottom:6px;
+}
+input{
+  width:100%;background:#060a0f;border:1px solid var(--brd);
+  color:var(--txt);font-family:var(--font-mono);font-size:13px;
+  padding:10px 14px;border-radius:8px;outline:none;
+  transition:border-color .2s,box-shadow .2s;
+}
+input:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(62,207,207,.12)}
+.btn{
+  width:100%;margin-top:4px;padding:11px;
+  background:var(--acc);border:none;border-radius:8px;
+  font-family:var(--font-sans);font-size:14px;font-weight:600;
+  color:#080b10;cursor:pointer;transition:opacity .15s,transform .1s;
+  letter-spacing:.01em;
+}
+.btn:hover{opacity:.88}
+.btn:active{transform:scale(.98)}
+.err{
+  font-size:12px;color:var(--err);background:rgba(255,0,85,.08);
+  border:1px solid rgba(255,0,85,.2);border-radius:6px;
+  padding:9px 12px;margin-bottom:16px;text-align:center;
+}
+.divider{height:1px;background:var(--brd);margin:24px 0}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="brand">
+    <div class="brand-icon">gs</div>
+    <div class="brand-name">git<span>/</span>sub</div>
+  </div>
+  {error}
+  <form method="POST" action="/login">
+    <div class="field">
+      <label>Username</label>
+      <input type="text" name="username" autocomplete="username" autofocus>
+    </div>
+    <div class="field">
+      <label>Password</label>
+      <input type="password" name="password" autocomplete="current-password">
+    </div>
+    <button class="btn" type="submit">Sign in</button>
+  </form>
+</div>
+</body>
+</html>"""
 
-/* Nav */
-nav{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;
-    background:var(--surf);border-bottom:1px solid var(--brd);position:sticky;top:0;z-index:20}
-.logo{font-family:var(--mono);font-size:15px;font-weight:600;color:var(--acc)}
-.logo span{color:var(--mut);font-weight:400}
-.nav-r{display:flex;align-items:center;gap:8px}
-.pill{font-family:var(--mono);font-size:11px;padding:5px 12px;border-radius:20px;
-      border:1px solid var(--brd);background:transparent;color:var(--txt);cursor:pointer;transition:all .15s}
-.pill:hover{border-color:var(--acc);color:var(--acc)}
-.pill.primary{background:var(--acc);border-color:var(--acc);color:#0d0f12}
-.pill.primary:hover{opacity:.85}
-.pill.danger{color:var(--err);border-color:rgba(255,77,109,.3)}
-.pill.danger:hover{border-color:var(--err)!important;color:var(--err)!important}
-.pill:disabled{opacity:.35;cursor:not-allowed}
 
-/* Tab bar */
-.tabs{display:flex;border-bottom:1px solid var(--brd);background:var(--surf);overflow-x:auto}
-.tab{font-family:var(--mono);font-size:12px;padding:12px 20px;cursor:pointer;
-     border:none;background:transparent;color:var(--mut);white-space:nowrap;
-     border-bottom:2px solid transparent;transition:all .15s}
-.tab.active{color:var(--acc);border-bottom-color:var(--acc)}
-.tab:hover:not(.active){color:var(--txt)}
+DASH_HTML = r"""<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>gitsub dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+/* ─── Tokens ─────────────────────────────────── */
+:root{
+  --bg:#080b10;
+  --surf:#0f1318;
+  --surf2:#141920;
+  --brd:#1a2030;
+  --brd2:#222a38;
+  --acc:#3ECFCF;
+  --acc-dim:rgba(62,207,207,.12);
+  --acc-glow:rgba(62,207,207,.25);
+  --blue:#4D9FFF;
+  --blue-dim:rgba(77,159,255,.12);
+  --warn:#F5A623;
+  --err:#FF3366;
+  --green:#2ECC8D;
+  --txt:#dde3ee;
+  --txt2:#8a95a8;
+  --txt3:#5a6478;
+  --mono:'DM Mono',monospace;
+  --sans:'DM Sans',sans-serif;
+  --r:8px;
+  --r-sm:5px;
+  --shadow:0 4px 24px rgba(0,0,0,.5);
+  --shadow-lg:0 16px 64px rgba(0,0,0,.6);
+}
+[data-theme="light"]{
+  --bg:#f0f2f5;--surf:#ffffff;--surf2:#f7f8fa;--brd:#e0e4ec;--brd2:#d0d5e0;
+  --txt:#1a2030;--txt2:#4a5568;--txt3:#8a95a8;--shadow:0 2px 12px rgba(0,0,0,.08);
+}
 
-/* Panels */
-.panel{display:none;padding:0}.panel.active{display:block}
+/* ─── Reset ──────────────────────────────────── */
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  background:var(--bg);color:var(--txt);font-family:var(--sans);
+  font-size:14px;min-height:100vh;line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+}
 
-/* Stats */
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:1px;background:var(--brd)}
-.stat{background:var(--surf);padding:14px 18px}
-.stat-l{font-family:var(--mono);font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px}
-.stat-v{font-family:var(--mono);font-size:20px;font-weight:600;color:var(--acc)}
-.stat-v.sm{font-size:12px;padding-top:2px;line-height:1.4}
+/* Grid bg for dark mode */
+body::before{
+  content:'';position:fixed;inset:0;
+  background-image:linear-gradient(var(--brd) 1px,transparent 1px),
+                   linear-gradient(90deg,var(--brd) 1px,transparent 1px);
+  background-size:48px 48px;opacity:.2;pointer-events:none;z-index:0;
+  transition:opacity .3s;
+}
+[data-theme="light"] body::before{opacity:0}
 
-/* Services */
-.svc-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;padding:16px 20px}
-.svc-card{background:var(--surf);border:1px solid var(--brd);border-radius:6px;padding:16px}
-.svc-name{font-family:var(--mono);font-size:12px;color:var(--mut);margin-bottom:8px;text-transform:uppercase;letter-spacing:1px}
-.svc-state{font-family:var(--mono);font-size:16px;font-weight:600;margin-bottom:6px}
-.svc-state.active{color:var(--acc)}
-.svc-state.inactive,.svc-state.failed{color:var(--err)}
-.svc-state.other{color:var(--warn)}
-.svc-since{font-family:var(--mono);font-size:10px;color:var(--mut)}
-.svc-actions{display:flex;gap:8px;margin-top:12px}
+/* ─── Layout shell ───────────────────────────── */
+#app{position:relative;z-index:1;display:flex;flex-direction:column;min-height:100vh}
 
-/* Toolbar */
-.toolbar{display:flex;align-items:center;gap:10px;padding:12px 20px;border-bottom:1px solid var(--brd);flex-wrap:wrap}
-.srch{flex:1;min-width:180px;position:relative}
-.srch input{width:100%;background:var(--surf);border:1px solid var(--brd);
-            color:var(--txt);font-family:var(--mono);font-size:12px;
-            padding:8px 10px 8px 28px;border-radius:4px;outline:none;transition:border-color .15s}
-.srch input:focus{border-color:var(--acc)}
-.srch-ic{position:absolute;left:9px;top:50%;transform:translateY(-50%);color:var(--mut);font-size:12px;pointer-events:none}
-.cnt{font-family:var(--mono);font-size:11px;color:var(--mut);white-space:nowrap}
+/* ─── Top bar ────────────────────────────────── */
+.topbar{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:0 24px;height:56px;
+  background:rgba(15,19,24,.8);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--brd);
+  position:sticky;top:0;z-index:100;
+  transition:background .3s;
+}
+[data-theme="light"] .topbar{background:rgba(255,255,255,.9)}
 
-/* Table */
+.brand{display:flex;align-items:center;gap:10px;text-decoration:none}
+.brand-icon{
+  width:28px;height:28px;background:var(--acc);border-radius:6px;
+  display:flex;align-items:center;justify-content:center;
+  font-family:var(--mono);font-size:11px;font-weight:500;color:#080b10;flex-shrink:0;
+}
+.brand-name{font-family:var(--mono);font-size:14px;font-weight:500;color:var(--txt)}
+.brand-name em{color:var(--txt3);font-style:normal}
+
+.topbar-center{display:flex;align-items:center;gap:4px}
+.tab-btn{
+  font-family:var(--sans);font-size:13px;font-weight:500;
+  padding:6px 14px;border-radius:var(--r-sm);border:none;
+  background:transparent;color:var(--txt2);cursor:pointer;
+  transition:all .15s;white-space:nowrap;
+}
+.tab-btn:hover{background:var(--surf2);color:var(--txt)}
+.tab-btn.active{background:var(--acc-dim);color:var(--acc)}
+
+.topbar-right{display:flex;align-items:center;gap:8px}
+
+/* Sync pulse indicator */
+.sync-indicator{
+  display:flex;align-items:center;gap:6px;
+  font-family:var(--mono);font-size:11px;color:var(--txt3);
+  padding:4px 10px;border-radius:20px;
+  border:1px solid var(--brd);background:var(--surf);
+}
+.pulse{
+  width:6px;height:6px;border-radius:50%;background:var(--txt3);
+  transition:background .3s;
+}
+.pulse.active{background:var(--warn);animation:blink 1.2s ease-in-out infinite}
+.pulse.ok{background:var(--green)}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+
+/* ─── Buttons ────────────────────────────────── */
+.btn{
+  font-family:var(--sans);font-size:13px;font-weight:500;
+  padding:7px 16px;border-radius:var(--r-sm);border:1px solid var(--brd);
+  background:var(--surf2);color:var(--txt);cursor:pointer;
+  transition:all .15s;white-space:nowrap;display:inline-flex;align-items:center;gap:6px;
+}
+.btn:hover{border-color:var(--brd2);background:var(--surf);color:var(--txt)}
+.btn.primary{background:var(--acc);border-color:var(--acc);color:#080b10;font-weight:600}
+.btn.primary:hover{opacity:.88}
+.btn.danger{color:var(--err);border-color:rgba(255,51,102,.25);background:transparent}
+.btn.danger:hover{background:rgba(255,51,102,.08);border-color:var(--err)}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--txt2)}
+.btn.ghost:hover{background:var(--surf2);color:var(--txt)}
+.btn.sm{padding:4px 10px;font-size:12px;border-radius:4px}
+.btn.xs{padding:2px 8px;font-size:11px;border-radius:4px;font-family:var(--mono)}
+.btn:disabled{opacity:.35;cursor:not-allowed}
+.btn.ok-flash{color:var(--green);border-color:var(--green)!important}
+
+/* ─── Panels ─────────────────────────────────── */
+.panel{display:none}.panel.active{display:block}
+
+/* ─── Stat strip ─────────────────────────────── */
+.stat-strip{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
+  gap:0;background:var(--brd);border-bottom:1px solid var(--brd);
+}
+.stat-cell{
+  background:var(--surf);padding:14px 20px;
+  transition:background .15s;
+}
+.stat-cell:hover{background:var(--surf2)}
+.stat-label{
+  font-family:var(--mono);font-size:10px;color:var(--txt3);
+  text-transform:uppercase;letter-spacing:.08em;margin-bottom:5px;
+}
+.stat-val{
+  font-family:var(--mono);font-size:18px;font-weight:500;color:var(--acc);
+}
+.stat-val.text{font-size:12px;line-height:1.4;color:var(--txt)}
+
+/* ─── Toolbar ────────────────────────────────── */
+.toolbar{
+  display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  padding:12px 20px;border-bottom:1px solid var(--brd);
+  background:var(--surf);
+}
+.search-wrap{flex:1;min-width:200px;position:relative}
+.search-wrap input{
+  width:100%;background:var(--bg);border:1px solid var(--brd);
+  color:var(--txt);font-family:var(--mono);font-size:12px;
+  padding:8px 12px 8px 32px;border-radius:var(--r-sm);outline:none;
+  transition:border-color .2s,box-shadow .2s;
+}
+.search-wrap input:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-glow)}
+.search-icon{
+  position:absolute;left:10px;top:50%;transform:translateY(-50%);
+  color:var(--txt3);font-size:13px;pointer-events:none;
+}
+.count-badge{
+  font-family:var(--mono);font-size:11px;color:var(--txt3);
+  white-space:nowrap;
+}
+
+/* ─── Table ──────────────────────────────────── */
 .tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
-table{width:100%;border-collapse:collapse;min-width:520px}
-thead th{font-family:var(--mono);font-size:10px;font-weight:500;text-transform:uppercase;
-         letter-spacing:1px;color:var(--mut);text-align:left;padding:9px 16px;
-         border-bottom:1px solid var(--brd);background:var(--surf);white-space:nowrap}
+table{width:100%;border-collapse:collapse;min-width:560px}
+thead{position:sticky;top:56px;z-index:10}
+thead th{
+  font-family:var(--mono);font-size:10px;font-weight:500;
+  text-transform:uppercase;letter-spacing:.08em;color:var(--txt3);
+  text-align:left;padding:10px 20px;
+  background:var(--surf2);border-bottom:1px solid var(--brd);
+  white-space:nowrap;
+}
 tbody tr{border-bottom:1px solid var(--brd);transition:background .1s}
-tbody tr:hover{background:var(--surf)}
-tbody td{padding:10px 16px;font-family:var(--mono);font-size:12px;vertical-align:top}
-.td-email{font-weight:500;color:var(--txt)}
-.td-meta{color:var(--mut);font-size:10px;margin-top:2px}
-.url-wrap{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
-.url-link{color:var(--acc2);text-decoration:none;border:1px solid rgba(0,122,255,.25);
-          border-radius:3px;padding:2px 8px;font-size:10px;transition:all .1s;white-space:nowrap}
-.url-link:hover{background:rgba(0,122,255,.1);border-color:var(--acc2)}
-.url-text{font-size:10px;color:var(--mut);margin-top:3px;word-break:break-all}
-.cp{font-size:10px;padding:2px 8px;border-radius:3px;border:1px solid var(--brd);
-    background:transparent;color:var(--txt);cursor:pointer;transition:all .1s;font-family:var(--mono)}
-.cp:hover{border-color:var(--acc);color:var(--acc)}
-.cp.ok{color:var(--acc);border-color:var(--acc)}
-.rot{font-size:10px;padding:2px 8px;border-radius:3px;border:1px solid rgba(255,159,67,.3);
-     background:transparent;color:var(--warn);cursor:pointer;font-family:var(--mono);transition:all .1s}
-.rot:hover{border-color:var(--warn)}
+tbody tr:hover{background:var(--surf2)}
+tbody td{padding:11px 20px;vertical-align:middle}
 
-/* Settings */
-.settings-wrap{max-width:680px;padding:20px}
-.set-group{margin-bottom:24px}
-.set-group-title{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:1px;
-                 color:var(--mut);margin-bottom:12px;padding-bottom:6px;border-bottom:1px solid var(--brd)}
-.set-row{display:grid;grid-template-columns:1fr 1fr auto;gap:10px;align-items:center;
-         padding:10px 0;border-bottom:1px solid rgba(30,35,48,.5)}
-.set-row:last-child{border:none}
-.set-label{font-family:var(--mono);font-size:12px;color:var(--txt)}
-.set-input{background:var(--bg);border:1px solid var(--brd);color:var(--txt);
-           font-family:var(--mono);font-size:12px;padding:6px 10px;border-radius:4px;
-           outline:none;width:100%;transition:border-color .15s}
-.set-input:focus{border-color:var(--acc)}
-.set-save{font-family:var(--mono);font-size:11px;padding:6px 14px;border-radius:4px;
-          border:1px solid var(--acc);background:transparent;color:var(--acc);
-          cursor:pointer;white-space:nowrap;transition:all .15s}
-.set-save:hover{background:var(--acc);color:#0d0f12}
-.set-note{font-size:10px;color:var(--mut);margin-top:3px}
+.cell-email{
+  font-family:var(--sans);font-size:13px;font-weight:500;color:var(--txt);
+}
+.cell-meta{
+  font-family:var(--mono);font-size:10px;color:var(--txt3);margin-top:2px;
+}
+.url-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.url-anchor{
+  font-family:var(--mono);font-size:11px;color:var(--blue);
+  text-decoration:none;border:1px solid var(--blue-dim);
+  padding:3px 9px;border-radius:4px;white-space:nowrap;
+  transition:all .15s;
+}
+.url-anchor:hover{background:var(--blue-dim);border-color:var(--blue)}
+.url-text{
+  font-family:var(--mono);font-size:10px;color:var(--txt3);
+  margin-top:3px;word-break:break-all;max-width:320px;
+}
+.updated-cell{
+  font-family:var(--mono);font-size:11px;color:var(--txt3);
+  white-space:nowrap;
+}
+.rotate-btn{color:var(--warn);border-color:rgba(245,166,35,.25)}
+.rotate-btn:hover{border-color:var(--warn);background:rgba(245,166,35,.08)}
 
-/* Hide number input spinners */
+/* Empty state */
+.empty{
+  text-align:center;padding:64px 20px;color:var(--txt3);
+}
+.empty-icon{font-size:32px;margin-bottom:12px;opacity:.5}
+.empty h3{font-size:15px;font-weight:500;color:var(--txt2);margin-bottom:6px}
+.empty p{font-size:13px}
+
+/* ─── Services tab ───────────────────────────── */
+.services-wrap{padding:20px;max-width:900px}
+
+.sync-hero{
+  background:var(--surf);border:1px solid var(--brd);border-radius:var(--r);
+  padding:20px 24px;margin-bottom:20px;
+}
+.sync-hero-header{
+  display:flex;align-items:flex-start;justify-content:space-between;
+  flex-wrap:wrap;gap:16px;margin-bottom:16px;
+}
+.sync-mode-label{
+  font-family:var(--mono);font-size:10px;text-transform:uppercase;
+  letter-spacing:.08em;color:var(--txt3);margin-bottom:6px;
+}
+.sync-mode-val{
+  font-family:var(--mono);font-size:15px;font-weight:500;
+  display:flex;align-items:center;gap:8px;
+}
+.sync-mode-sub{
+  font-size:12px;color:var(--txt3);margin-top:4px;font-family:var(--mono);
+}
+.interval-row{
+  display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+}
+.interval-label{font-size:12px;color:var(--txt3);font-family:var(--mono)}
+.interval-input{
+  width:88px;background:var(--bg);border:1px solid var(--brd);
+  color:var(--txt);font-family:var(--mono);font-size:12px;
+  padding:6px 10px;border-radius:var(--r-sm);outline:none;
+  transition:border-color .2s,box-shadow .2s;
+}
+.interval-input:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-glow)}
 input[type=number]::-webkit-inner-spin-button,
 input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
 input[type=number]{-moz-appearance:textfield}
 
-/* Sync dot */
-.dot{width:7px;height:7px;border-radius:50%;background:var(--mut);display:inline-block;margin-right:5px}
-.dot.on{background:var(--warn);animation:pulse 1s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-
-/* Toast */
-.toast{position:fixed;bottom:20px;right:20px;background:var(--surf);border:1px solid var(--brd);
-       border-left:3px solid var(--acc);padding:10px 16px;font-family:var(--mono);font-size:12px;
-       border-radius:4px;box-shadow:0 8px 24px rgba(0,0,0,.5);opacity:0;transform:translateY(8px);
-       transition:all .2s;pointer-events:none;z-index:100;max-width:calc(100vw - 40px)}
-.toast.show{opacity:1;transform:translateY(0)}
-.toast.err{border-left-color:var(--err)}
-
-/* Empty */
-.empty{text-align:center;padding:48px 20px;color:var(--mut);font-family:var(--mono)}
-.empty h3{font-size:14px;margin-bottom:6px;color:var(--txt)}
-
-/* Mobile */
-@media(max-width:600px){
-  nav{padding:12px 14px}
-  .pill{padding:5px 10px;font-size:10px}
-  thead th,tbody td{padding:8px 12px}
-  .toolbar{padding:10px 12px}
-  .settings-wrap{padding:14px}
-  .set-row{grid-template-columns:1fr;gap:6px}
-  .svc-grid{padding:12px}
-  .stat-v{font-size:16px}
-  .url-text{display:none}
+.sync-stats{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));
+  gap:1px;background:var(--brd);border-radius:var(--r-sm);overflow:hidden;
 }
+.sync-stat{background:var(--surf2);padding:10px 14px}
+.sync-stat-label{font-family:var(--mono);font-size:10px;color:var(--txt3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px}
+.sync-stat-val{font-family:var(--mono);font-size:12px;color:var(--txt)}
+
+.svc-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}
+.svc-card{
+  background:var(--surf);border:1px solid var(--brd);border-radius:var(--r);
+  padding:18px 20px;transition:border-color .15s;
+}
+.svc-card:hover{border-color:var(--brd2)}
+.svc-card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.svc-name{font-family:var(--mono);font-size:11px;color:var(--txt3);text-transform:uppercase;letter-spacing:.06em}
+.svc-dot{width:8px;height:8px;border-radius:50%;background:var(--txt3)}
+.svc-dot.running{background:var(--green);box-shadow:0 0 0 3px rgba(46,204,141,.2)}
+.svc-dot.failed{background:var(--err)}
+.svc-status{font-family:var(--mono);font-size:14px;font-weight:500;margin-bottom:4px}
+.svc-status.running{color:var(--green)}
+.svc-status.stopped{color:var(--txt3)}
+.svc-status.failed{color:var(--err)}
+.svc-detail{font-family:var(--mono);font-size:10px;color:var(--txt3);line-height:1.6}
+.svc-actions{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
+
+/* ─── Settings tab ───────────────────────────── */
+.settings-wrap{
+  display:grid;grid-template-columns:200px 1fr;min-height:calc(100vh - 120px);
+}
+.settings-nav{
+  border-right:1px solid var(--brd);padding:20px 0;
+  background:var(--surf);position:sticky;top:56px;align-self:start;
+}
+.settings-nav-item{
+  display:block;width:100%;text-align:left;padding:9px 20px;border:none;
+  background:transparent;font-family:var(--sans);font-size:13px;font-weight:400;
+  color:var(--txt2);cursor:pointer;transition:all .15s;border-left:2px solid transparent;
+}
+.settings-nav-item:hover{background:var(--surf2);color:var(--txt)}
+.settings-nav-item.active{color:var(--acc);border-left-color:var(--acc);background:var(--acc-dim);font-weight:500}
+.settings-content{padding:24px;max-width:640px}
+
+.settings-section{display:none}.settings-section.active{display:block}
+.settings-section h3{
+  font-size:15px;font-weight:600;color:var(--txt);margin-bottom:4px;
+}
+.settings-section .section-desc{
+  font-size:13px;color:var(--txt3);margin-bottom:20px;
+}
+.field-group{
+  background:var(--surf);border:1px solid var(--brd);border-radius:var(--r);
+  overflow:hidden;margin-bottom:16px;
+}
+.field-row{
+  display:grid;grid-template-columns:1fr 1fr 80px;gap:12px;align-items:start;
+  padding:14px 16px;border-bottom:1px solid var(--brd);
+}
+.field-row:last-child{border-bottom:none}
+.field-label{font-size:13px;font-weight:500;color:var(--txt);padding-top:2px}
+.field-note{font-size:11px;color:var(--txt3);margin-top:3px;line-height:1.4}
+.field-input{
+  background:var(--bg);border:1px solid var(--brd);
+  color:var(--txt);font-family:var(--mono);font-size:12px;
+  padding:7px 11px;border-radius:var(--r-sm);outline:none;width:100%;
+  transition:border-color .2s,box-shadow .2s;
+}
+.field-input:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-glow)}
+.field-save{
+  align-self:start;padding:7px 14px;font-size:12px;
+  background:transparent;border:1px solid var(--brd2);border-radius:var(--r-sm);
+  color:var(--txt2);font-family:var(--sans);font-weight:500;
+  cursor:pointer;transition:all .15s;white-space:nowrap;
+}
+.field-save:hover{border-color:var(--acc);color:var(--acc);background:var(--acc-dim)}
+.field-save.saved{border-color:var(--green);color:var(--green);background:rgba(46,204,141,.08)}
+
+/* ─── Theme toggle ───────────────────────────── */
+.theme-toggle{
+  width:34px;height:34px;border-radius:var(--r-sm);border:1px solid var(--brd);
+  background:var(--surf2);color:var(--txt2);cursor:pointer;
+  display:flex;align-items:center;justify-content:center;font-size:15px;
+  transition:all .15s;flex-shrink:0;
+}
+.theme-toggle:hover{border-color:var(--acc);color:var(--acc);background:var(--acc-dim)}
+
+/* ─── Toast ──────────────────────────────────── */
+.toast{
+  position:fixed;bottom:24px;right:24px;
+  background:var(--surf);border:1px solid var(--brd);
+  border-left:3px solid var(--acc);
+  padding:12px 18px;border-radius:var(--r);
+  font-family:var(--mono);font-size:12px;color:var(--txt);
+  box-shadow:var(--shadow-lg);
+  opacity:0;transform:translateY(10px) scale(.98);
+  transition:all .2s cubic-bezier(.16,1,.3,1);
+  pointer-events:none;z-index:9999;max-width:340px;
+}
+.toast.show{opacity:1;transform:translateY(0) scale(1)}
+.toast.err{border-left-color:var(--err)}
+.toast.ok{border-left-color:var(--green)}
+
+/* ─── Mobile ─────────────────────────────────── */
+@media(max-width:700px){
+  .topbar{padding:0 14px}
+  .topbar-center{display:none}
+  thead th,tbody td{padding:9px 12px}
+  .toolbar{padding:10px 12px}
+  .url-text{display:none}
+  .services-wrap{padding:14px}
+  .settings-wrap{grid-template-columns:1fr}
+  .settings-nav{border-right:none;border-bottom:1px solid var(--brd);
+    display:flex;overflow-x:auto;padding:0;position:static;}
+  .settings-nav-item{border-left:none;border-bottom:2px solid transparent;white-space:nowrap}
+  .settings-nav-item.active{border-left:none;border-bottom-color:var(--acc)}
+  .settings-content{padding:14px}
+  .field-row{grid-template-columns:1fr;gap:8px}
+  .sync-hero-header{flex-direction:column}
+  .svc-cards{grid-template-columns:1fr}
+  .mobile-tabs{
+    display:flex!important;overflow-x:auto;border-bottom:1px solid var(--brd);
+    background:var(--surf);padding:0;
+  }
+  .stat-strip{grid-template-columns:1fr 1fr}
+}
+@media(min-width:701px){.mobile-tabs{display:none!important}}
 </style>
 </head>
 <body>
+<div id="app">
 
-<nav>
-  <div class="logo">git<span>/</span>sub</div>
-  <div class="nav-r">
-    <span style="font-family:var(--mono);font-size:11px;color:var(--mut)">
-      <span class="dot" id="sdot"></span><span id="sstat">idle</span>
-    </span>
-    <button class="pill primary" id="sync-btn" onclick="doSync()">⟳ Sync</button>
-    <a href="/logout"><button class="pill danger">logout</button></a>
+<!-- ── Top bar ── -->
+<header class="topbar">
+  <a class="brand" href="/">
+    <div class="brand-icon">gs</div>
+    <div class="brand-name">git<em>/</em>sub</div>
+  </a>
+
+  <!-- Desktop tabs -->
+  <nav class="topbar-center">
+    <button class="tab-btn active" onclick="switchTab('users',this)">Users</button>
+    <button class="tab-btn" onclick="switchTab('services',this)">Services</button>
+    <button class="tab-btn" onclick="switchTab('settings',this)">Settings</button>
+  </nav>
+
+  <div class="topbar-right">
+    <div class="sync-indicator">
+      <div class="pulse" id="pulse"></div>
+      <span id="sync-label" style="font-family:var(--mono);font-size:11px">idle</span>
+    </div>
+    <button class="btn primary" id="sync-btn" onclick="doSync()">
+      <span>⟳</span><span>Sync</span>
+    </button>
+    <button class="theme-toggle" onclick="toggleTheme()" title="Toggle theme">☾</button>
+    <a href="/logout"><button class="btn danger sm">logout</button></a>
   </div>
+</header>
+
+<!-- Mobile tabs -->
+<nav class="mobile-tabs">
+  <button class="tab-btn active" onclick="switchTab('users',this)">Users</button>
+  <button class="tab-btn" onclick="switchTab('services',this)">Services</button>
+  <button class="tab-btn" onclick="switchTab('settings',this)">Settings</button>
 </nav>
 
-<div class="tabs">
-  <button class="tab active" onclick="showTab('users',this)">Users</button>
-  <button class="tab" onclick="showTab('services',this)">Services</button>
-  <button class="tab" onclick="showTab('settings',this)">Settings</button>
-</div>
-
-<!-- USERS TAB -->
-<div class="panel active" id="tab-users">
-  <div class="stats" id="stats-bar">
-    <div class="stat"><div class="stat-l">Total Users</div><div class="stat-v" id="s-tot">—</div></div>
-    <div class="stat"><div class="stat-l">GitHub Repo</div><div class="stat-v sm" id="s-repo">—</div></div>
-    <div class="stat"><div class="stat-l">Last Sync</div><div class="stat-v sm" id="s-sync">—</div></div>
-  </div>
-  <div class="toolbar">
-    <div class="srch"><span class="srch-ic">⌕</span>
-      <input id="q" type="text" placeholder="filter by email or sub ID…" oninput="filter()">
+<!-- ════════════════════════════════════════════ -->
+<!-- USERS PANEL                                  -->
+<!-- ════════════════════════════════════════════ -->
+<div class="panel active" id="panel-users">
+  <div class="stat-strip" id="stat-strip">
+    <div class="stat-cell">
+      <div class="stat-label">Total users</div>
+      <div class="stat-val" id="stat-total">—</div>
     </div>
-    <span class="cnt" id="cnt"></span>
-    <button class="pill" id="sort-btn" onclick="toggleSort()">↕ sort: A–Z</button>
-    <button class="pill" onclick="copyAll()">copy all</button>
+    <div class="stat-cell">
+      <div class="stat-label">GitHub repo</div>
+      <div class="stat-val text" id="stat-repo">—</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-label">Last sync</div>
+      <div class="stat-val text" id="stat-sync">—</div>
+    </div>
   </div>
+
+  <div class="toolbar">
+    <div class="search-wrap">
+      <span class="search-icon">⌕</span>
+      <input type="text" id="search" placeholder="Search by email or sub ID…" oninput="filterTable()">
+    </div>
+    <span class="count-badge" id="count-badge"></span>
+    <button class="btn sm" id="sort-btn" onclick="toggleSort()">↑↓ A–Z</button>
+    <button class="btn sm" onclick="copyAllURLs()">copy all URLs</button>
+  </div>
+
   <div class="tbl-wrap">
     <table>
-      <thead><tr>
-        <th>Email</th><th>Sub ID · File</th><th>Raw URL</th><th>Updated</th><th></th>
-      </tr></thead>
-      <tbody id="tbody"><tr><td colspan="5"><div class="empty"><h3>Loading…</h3></div></td></tr></tbody>
+      <thead>
+        <tr>
+          <th>Email</th>
+          <th>Sub ID / File</th>
+          <th>Subscription URL</th>
+          <th>Updated</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="tbl-body">
+        <tr><td colspan="5"><div class="empty">
+          <div class="empty-icon">⟳</div>
+          <h3>Loading users…</h3>
+        </div></td></tr>
+      </tbody>
     </table>
   </div>
 </div>
 
-<!-- SERVICES TAB -->
-<div class="panel" id="tab-services">
-  <!-- Sync status panel -->
-  <div id="sync-panel" style="padding:16px 20px;border-bottom:1px solid var(--brd);background:var(--surf)">
-    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
-      <div>
-        <div style="font-family:var(--mono);font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Sync Daemon</div>
-        <div id="sync-mode-badge" style="font-family:var(--mono);font-size:14px;font-weight:600">—</div>
-        <div id="sync-next" style="font-family:var(--mono);font-size:11px;color:var(--mut);margin-top:4px"></div>
+<!-- ════════════════════════════════════════════ -->
+<!-- SERVICES PANEL                               -->
+<!-- ════════════════════════════════════════════ -->
+<div class="panel" id="panel-services">
+  <div class="services-wrap">
+
+    <!-- Sync hero card -->
+    <div class="sync-hero">
+      <div class="sync-hero-header">
+        <div>
+          <div class="sync-mode-label">Sync daemon</div>
+          <div class="sync-mode-val" id="daemon-mode">—</div>
+          <div class="sync-mode-sub" id="daemon-next"></div>
+        </div>
+        <div class="interval-row">
+          <span class="interval-label">Interval</span>
+          <input class="interval-input" id="interval-val" type="number" min="60">
+          <span class="interval-label">sec</span>
+          <button class="btn sm" onclick="applyInterval()">Apply</button>
+          <button class="btn primary sm" onclick="doSync()">⟳ Sync now</button>
+        </div>
       </div>
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        <div style="font-family:var(--mono);font-size:11px;color:var(--mut)">Interval:</div>
-        <input id="interval-input" type="number" min="60"
-               style="width:90px;background:var(--bg);border:1px solid var(--brd);color:var(--txt);
-                      font-family:var(--mono);font-size:12px;padding:6px 8px;border-radius:4px;outline:none">
-        <span style="font-family:var(--mono);font-size:11px;color:var(--mut)">seconds</span>
-        <button class="pill" onclick="saveInterval()">Apply</button>
-        <button class="pill primary" onclick="doSync()">⟳ Sync Now</button>
+      <div class="sync-stats">
+        <div class="sync-stat">
+          <div class="sync-stat-label">Last sync</div>
+          <div class="sync-stat-val" id="si-last">—</div>
+        </div>
+        <div class="sync-stat">
+          <div class="sync-stat-label">Next sync</div>
+          <div class="sync-stat-val" id="si-next">—</div>
+        </div>
+        <div class="sync-stat">
+          <div class="sync-stat-label">Interval</div>
+          <div class="sync-stat-val" id="si-interval">—</div>
+        </div>
+        <div class="sync-stat">
+          <div class="sync-stat-label">Right now</div>
+          <div class="sync-stat-val" id="si-now">Idle</div>
+        </div>
       </div>
     </div>
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:1px;background:var(--brd);margin-top:14px;border-radius:4px;overflow:hidden">
-      <div style="background:var(--bg);padding:10px 14px">
-        <div style="font-family:var(--mono);font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:1px;margin-bottom:3px">Last sync</div>
-        <div id="si-last" style="font-family:var(--mono);font-size:12px">—</div>
-      </div>
-      <div style="background:var(--bg);padding:10px 14px">
-        <div style="font-family:var(--mono);font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:1px;margin-bottom:3px">Next sync</div>
-        <div id="si-next" style="font-family:var(--mono);font-size:12px">—</div>
-      </div>
-      <div style="background:var(--bg);padding:10px 14px">
-        <div style="font-family:var(--mono);font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:1px;margin-bottom:3px">Interval</div>
-        <div id="si-interval" style="font-family:var(--mono);font-size:12px">—</div>
-      </div>
-      <div style="background:var(--bg);padding:10px 14px">
-        <div style="font-family:var(--mono);font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:1px;margin-bottom:3px">Status now</div>
-        <div id="si-now" style="font-family:var(--mono);font-size:12px">—</div>
-      </div>
+
+    <!-- Service cards -->
+    <div class="svc-cards" id="svc-cards">
+      <div class="empty"><p>Loading services…</p></div>
     </div>
-  </div>
-  <div class="svc-grid" id="svc-grid">
-    <div class="empty"><h3>Loading…</h3></div>
   </div>
 </div>
 
-<!-- SETTINGS TAB -->
-<div class="panel" id="tab-settings">
-  <div class="settings-wrap" id="settings-wrap">
-    <div class="empty"><h3>Loading…</h3></div>
+<!-- ════════════════════════════════════════════ -->
+<!-- SETTINGS PANEL                               -->
+<!-- ════════════════════════════════════════════ -->
+<div class="panel" id="panel-settings">
+  <div class="settings-wrap">
+    <nav class="settings-nav" id="settings-nav">
+      <button class="settings-nav-item active" onclick="switchSection('panel',this)">Panel</button>
+      <button class="settings-nav-item" onclick="switchSection('github',this)">GitHub</button>
+      <button class="settings-nav-item" onclick="switchSection('sync',this)">Sync</button>
+      <button class="settings-nav-item" onclick="switchSection('webui',this)">Web UI</button>
+      <button class="settings-nav-item" onclick="switchSection('subs',this)">Subscriptions</button>
+      <button class="settings-nav-item" onclick="switchSection('nginx',this)">Nginx</button>
+    </nav>
+
+    <div class="settings-content" id="settings-content">
+      <!-- dynamically rendered -->
+    </div>
   </div>
 </div>
 
+</div><!-- #app -->
 <div class="toast" id="toast"></div>
 
 <script>
-let rows=[], pollTimer, sortDir='asc';
+// ── State ────────────────────────────────────
+let rows=[], sortDir='asc', pollTimer=null;
 
-// ── Tabs ──────────────────────────────────────
-function showTab(id, btn) {
+// ── Theme ────────────────────────────────────
+function initTheme(){
+  const saved = localStorage.getItem('gs-theme') || 'dark';
+  document.documentElement.dataset.theme = saved;
+  document.querySelector('.theme-toggle').textContent = saved==='dark' ? '☾' : '☀';
+}
+function toggleTheme(){
+  const cur = document.documentElement.dataset.theme;
+  const next = cur==='dark' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next;
+  localStorage.setItem('gs-theme', next);
+  document.querySelector('.theme-toggle').textContent = next==='dark' ? '☾' : '☀';
+}
+initTheme();
+
+// ── Tabs ─────────────────────────────────────
+function switchTab(id, btn){
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-  document.getElementById('tab-'+id).classList.add('active');
-  btn.classList.add('active');
+  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+  document.getElementById('panel-'+id).classList.add('active');
+  document.querySelectorAll('.tab-btn').forEach(b=>{
+    if(b.textContent.trim().toLowerCase()===id) b.classList.add('active');
+  });
   if(id==='services') loadServices();
-  if(id==='settings') loadSettings();
+  if(id==='settings') initSettings();
 }
 
-// ── Toast ─────────────────────────────────────
+// ── Toast ────────────────────────────────────
 function toast(msg,type=''){
   const el=document.getElementById('toast');
-  el.textContent=msg; el.className='toast show'+(type?' '+type:'');
-  clearTimeout(el._t); el._t=setTimeout(()=>el.className='toast',3000);
+  el.textContent=msg;
+  el.className='toast show'+(type?' '+type:'');
+  clearTimeout(el._t);
+  el._t=setTimeout(()=>el.className='toast',3200);
 }
 
 function esc(s){
   return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-// ── Users ─────────────────────────────────────
-async function loadData(){
-  const r=await fetch('/api/data');
+// ── Users ────────────────────────────────────
+async function loadUsers(){
+  const r = await fetch('/api/data');
   if(r.status===401){location='/login';return;}
-  const d=await r.json();
-  rows=d.entries;
+  const d = await r.json();
+  rows = d.entries;
+  applySortAndRender();
+  document.getElementById('stat-total').textContent = d.total;
+  document.getElementById('stat-repo').textContent  = d.repo || '—';
+  document.getElementById('stat-sync').textContent  = d.last_sync || 'never';
+  document.getElementById('count-badge').textContent= `${d.total} users`;
+}
+
+function applySortAndRender(){
   rows.sort((a,b)=> sortDir==='asc'
     ? (a.email||'').localeCompare(b.email||'')
     : (b.email||'').localeCompare(a.email||''));
-  render(rows);
-  document.getElementById('s-tot').textContent=d.total;
-  document.getElementById('s-repo').textContent=d.repo||'—';
-  document.getElementById('s-sync').textContent=d.last_sync||'—';
-  document.getElementById('cnt').textContent=`${d.total} users`;
+  filterTable();
 }
 
-function render(data){
-  const tb=document.getElementById('tbody');
-  if(!data.length){tb.innerHTML='<tr><td colspan="5"><div class="empty"><h3>No users yet</h3><p>Run a sync.</p></div></td></tr>';return;}
-  tb.innerHTML=data.map(r=>`
+function filterTable(){
+  const q = document.getElementById('search').value.toLowerCase();
+  const filtered = q
+    ? rows.filter(r=>(r.email||'').toLowerCase().includes(q)||(r.sub_id||'').toLowerCase().includes(q))
+    : rows;
+  renderRows(filtered);
+  document.getElementById('count-badge').textContent =
+    q ? `${filtered.length} of ${rows.length}` : `${rows.length} users`;
+}
+
+function renderRows(data){
+  const tbody = document.getElementById('tbl-body');
+  if(!data.length){
+    tbody.innerHTML=`<tr><td colspan="5"><div class="empty">
+      <div class="empty-icon">◦</div>
+      <h3>No users found</h3>
+      <p>Run a sync to populate</p>
+    </div></td></tr>`;
+    return;
+  }
+  tbody.innerHTML = data.map(r=>`
     <tr>
-      <td class="td-email">${esc(r.email)}</td>
+      <td><div class="cell-email">${esc(r.email)}</div></td>
       <td>
-        <div class="td-meta" title="${esc(r.sub_id)}">${esc(r.sub_id.slice(0,14))}…</div>
-        <div class="td-meta">${esc(r.filename)}</div>
+        <div class="cell-meta" title="${esc(r.sub_id)}">${esc(r.sub_id.slice(0,14))}…</div>
+        <div class="cell-meta">${esc(r.filename)}</div>
       </td>
       <td>
-        <div class="url-wrap">
-          <a class="url-link" href="${esc(r.raw_url)}" target="_blank">open ↗</a>
-          <button class="cp" onclick="cpURL('${esc(r.raw_url)}',this)">copy</button>
+        <div class="url-actions">
+          <a class="url-anchor" href="${esc(r.raw_url)}" target="_blank">open ↗</a>
+          <button class="btn xs" onclick="cpURL('${esc(r.raw_url)}',this)">copy</button>
         </div>
         <div class="url-text">${esc(r.raw_url)}</div>
       </td>
-      <td style="color:var(--mut);font-size:11px">${esc(r.updated)}</td>
-      <td><button class="rot" onclick="rotate('${esc(r.sub_id)}','${esc(r.email)}')">rotate</button></td>
+      <td class="updated-cell">${esc(r.updated)}</td>
+      <td>
+        <button class="btn xs rotate-btn" onclick="rotateUser('${esc(r.sub_id)}','${esc(r.email)}')">rotate</button>
+      </td>
     </tr>`).join('');
 }
 
 function toggleSort(){
   sortDir = sortDir==='asc' ? 'desc' : 'asc';
-  document.getElementById('sort-btn').textContent = sortDir==='asc' ? '↕ sort: A–Z' : '↕ sort: Z–A';
-  rows.sort((a,b)=> sortDir==='asc'
-    ? (a.email||'').localeCompare(b.email||'')
-    : (b.email||'').localeCompare(a.email||''));
-  filter();
-}
-
-function filter(){
-  const q=document.getElementById('q').value.toLowerCase();
-  const f=q?rows.filter(r=>(r.email||'').toLowerCase().includes(q)||(r.sub_id||'').toLowerCase().includes(q)):rows;
-  render(f);
-  document.getElementById('cnt').textContent=`${f.length}/${rows.length} users`;
+  document.getElementById('sort-btn').textContent = sortDir==='asc' ? '↑↓ A–Z' : '↑↓ Z–A';
+  applySortAndRender();
 }
 
 function cpURL(url,btn){
-  const done=()=>{btn.textContent='✓';btn.classList.add('ok');setTimeout(()=>{btn.textContent='copy';btn.classList.remove('ok')},1500)};
-  if(navigator.clipboard&&window.isSecureContext) navigator.clipboard.writeText(url).then(done);
-  else{const t=document.createElement('textarea');t.value=url;t.style.cssText='position:fixed;opacity:0';document.body.appendChild(t);t.focus();t.select();document.execCommand('copy');document.body.removeChild(t);done();}
+  const done=()=>{
+    btn.textContent='✓'; btn.classList.add('ok-flash');
+    setTimeout(()=>{btn.textContent='copy';btn.classList.remove('ok-flash')},1600);
+  };
+  if(navigator.clipboard&&window.isSecureContext)
+    navigator.clipboard.writeText(url).then(done);
+  else{
+    const t=document.createElement('textarea');t.value=url;
+    t.style.cssText='position:fixed;opacity:0';
+    document.body.appendChild(t);t.focus();t.select();
+    document.execCommand('copy');document.body.removeChild(t);done();
+  }
 }
 
-function copyAll(){
+function copyAllURLs(){
   const urls=rows.map(r=>r.raw_url).join('\n');
-  if(navigator.clipboard&&window.isSecureContext) navigator.clipboard.writeText(urls).then(()=>toast('Copied all URLs'));
-  else{const t=document.createElement('textarea');t.value=urls;t.style.cssText='position:fixed;opacity:0';document.body.appendChild(t);t.focus();t.select();document.execCommand('copy');document.body.removeChild(t);toast('Copied all URLs');}
+  if(navigator.clipboard&&window.isSecureContext)
+    navigator.clipboard.writeText(urls).then(()=>toast('Copied all URLs','ok'));
+  else{
+    const t=document.createElement('textarea');t.value=urls;
+    t.style.cssText='position:fixed;opacity:0';
+    document.body.appendChild(t);t.focus();t.select();
+    document.execCommand('copy');document.body.removeChild(t);
+    toast('Copied all URLs','ok');
+  }
 }
 
+async function rotateUser(sub_id,email){
+  if(!confirm(`Rotate URL for ${email}?\n\nThey will need the new link to reconnect.`)) return;
+  const r=await fetch('/api/rotate',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({sub_id})});
+  const d=await r.json();
+  if(d.ok){toast(`Rotated: ${email}`,'ok');loadUsers();}
+  else toast(d.msg||'Rotate failed','err');
+}
+
+// ── Sync ─────────────────────────────────────
 async function doSync(){
-  document.getElementById('sync-btn').disabled=true;
+  const btn=document.getElementById('sync-btn');
+  btn.disabled=true;
   const r=await fetch('/api/sync',{method:'POST'});
   if(r.status===401){location='/login';return;}
   const d=await r.json();
-  if(d.ok){toast('Sync started…');pollSync();}
-  else{toast(d.msg||'Already running','err');document.getElementById('sync-btn').disabled=false;}
+  if(d.ok){
+    toast('Sync started…');
+    setSyncPulse('syncing');
+    pollForSyncEnd();
+  } else {
+    toast(d.msg||'Already running','err');
+    btn.disabled=false;
+  }
 }
 
-function pollSync(){
+function setSyncPulse(state){
+  const p=document.getElementById('pulse');
+  const l=document.getElementById('sync-label');
+  if(state==='syncing'){p.className='pulse active';l.textContent='syncing';}
+  else if(state==='ok'){p.className='pulse ok';l.textContent='idle';setTimeout(()=>{p.className='pulse';},3000);}
+  else{p.className='pulse';l.textContent='idle';}
+}
+
+function pollForSyncEnd(){
   clearInterval(pollTimer);
   pollTimer=setInterval(async()=>{
     const r=await fetch('/api/sync/status');
     const d=await r.json();
-    const dot=document.getElementById('sdot'),st=document.getElementById('sstat'),btn=document.getElementById('sync-btn');
-    if(d.running){dot.className='dot on';st.textContent='syncing';}
-    else{dot.className='dot';st.textContent='idle';btn.disabled=false;clearInterval(pollTimer);loadData();toast('Sync complete ✓');}
+    if(!d.running){
+      clearInterval(pollTimer);
+      document.getElementById('sync-btn').disabled=false;
+      setSyncPulse('ok');
+      loadUsers();
+      toast('Sync complete ✓','ok');
+      // Refresh service info if tab visible
+      if(document.getElementById('panel-services').classList.contains('active'))
+        loadSyncInfo();
+    }
   },2000);
 }
 
-async function rotate(sub_id,email){
-  if(!confirm(`Rotate URL for ${email}?\nThey will need the new subscription link.`))return;
-  const r=await fetch('/api/rotate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sub_id})});
-  const d=await r.json();
-  if(d.ok){toast(`Rotated: ${email}`);loadData();}else toast(d.msg||'Failed','err');
-}
-
-// ── Services ──────────────────────────────────
+// ── Services ─────────────────────────────────
 async function loadSyncInfo(){
   const r=await fetch('/api/sync/info');
   if(r.status===401){location='/login';return;}
   const d=await r.json();
-  const badge=document.getElementById('sync-mode-badge');
-  const inp=document.getElementById('interval-input');
-  badge.textContent=d.daemon_active?'● Auto (daemon running)':'○ Manual only';
-  badge.style.color=d.daemon_active?'var(--acc)':'var(--warn)';
-  document.getElementById('sync-next').textContent=
-    d.daemon_active?(d.syncing_now?'Syncing now…':'Next in: '+d.countdown):'Daemon not running — syncs are manual only';
-  document.getElementById('si-last').textContent=d.last_sync||'never';
-  document.getElementById('si-next').textContent=d.daemon_active?d.next_sync:'—';
-  document.getElementById('si-interval').textContent=d.interval_fmt+' ('+d.interval+'s)';
-  document.getElementById('si-now').textContent=d.syncing_now?'🔄 Syncing…':'Idle';
-  if(inp&&!inp.dataset.dirty) inp.value=d.interval;
+
+  const modeEl=document.getElementById('daemon-mode');
+  modeEl.innerHTML = d.daemon_active
+    ? `<span style="color:var(--green)">● auto</span> <span style="color:var(--txt3);font-size:12px">daemon running</span>`
+    : `<span style="color:var(--warn)">○ manual</span> <span style="color:var(--txt3);font-size:12px">daemon not running</span>`;
+
+  document.getElementById('daemon-next').textContent = d.daemon_active
+    ? (d.syncing_now ? '⟳ syncing right now…' : `next sync in ${d.countdown}`)
+    : 'start xui-subsync to enable automatic syncing';
+
+  document.getElementById('si-last').textContent     = d.last_sync||'never';
+  document.getElementById('si-next').textContent     = d.daemon_active ? d.next_sync : '—';
+  document.getElementById('si-interval').textContent = `${d.interval_fmt} (${d.interval}s)`;
+  document.getElementById('si-now').textContent      = d.syncing_now ? '⟳ Syncing…' : 'Idle';
+
+  const inp=document.getElementById('interval-val');
+  if(inp&&!inp.dataset.touched) inp.value=d.interval;
 }
 
-async function saveInterval(){
-  const val=parseInt(document.getElementById('interval-input').value);
-  if(!val||val<60){toast('Minimum 60 seconds','err');return;}
-  const r=await fetch('/api/settings',{method:'POST',
-    headers:{'Content-Type':'application/json'},
+async function applyInterval(){
+  const val=parseInt(document.getElementById('interval-val').value);
+  if(!val||val<60){toast('Minimum is 60 seconds','err');return;}
+  const r=await fetch('/api/settings',{
+    method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({key:'sync_interval',value:String(val)})});
   const d=await r.json();
   if(d.ok){
-    toast('Interval saved. Restarting sync daemon…');
-    await fetch('/api/service',{method:'POST',
-      headers:{'Content-Type':'application/json'},
+    toast('Interval saved — restarting sync daemon…','ok');
+    await fetch('/api/service',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({action:'restart',name:'xui-subsync'})});
-    setTimeout(loadSyncInfo,2000);
+    setTimeout(loadSyncInfo,1800);
   } else toast(d.msg||'Save failed','err');
 }
 
 async function loadServices(){
-  loadSyncInfo();
+  await loadSyncInfo();
   const r=await fetch('/api/services');
   if(r.status===401){location='/login';return;}
   const d=await r.json();
-  const grid=document.getElementById('svc-grid');
-  grid.innerHTML=d.services.map(s=>`
+  const wrap=document.getElementById('svc-cards');
+  wrap.innerHTML=d.services.map(s=>{
+    const st=s.active?'running':(s.state==='failed'?'failed':'stopped');
+    return `
     <div class="svc-card">
-      <div class="svc-name">${esc(s.name)}</div>
-      <div class="svc-state ${s.active?'active':s.state==='failed'?'failed':'other'}">
-        ${s.active?'● active':'○ '+esc(s.state)}
+      <div class="svc-card-header">
+        <span class="svc-name">${esc(s.name)}</span>
+        <span class="svc-dot ${s.active?'running':(s.state==='failed'?'failed':'')}"></span>
       </div>
-      <div class="svc-since">${s.active?'Since: ':''} ${esc(s.since)}</div>
+      <div class="svc-status ${st}">${s.active?'● running':(s.state==='failed'?'✗ failed':'○ stopped')}</div>
+      <div class="svc-detail">
+        ${s.active?`Since ${esc(s.since)}<br>`:''}
+        PID ${esc(s.pid)} · Memory ${esc(s.memory)}
+      </div>
       <div class="svc-actions">
-        <button class="pill" onclick="svcAction('restart','${esc(s.name)}')">restart</button>
-        <button class="pill" onclick="svcAction(s.active?'stop':'start','${esc(s.name)}')">
-          ${s.active?'stop':'start'}
-        </button>
+        <button class="btn sm" onclick="svcAct('restart','${esc(s.name)}')">restart</button>
+        <button class="btn sm ${s.active?'danger':''}" onclick="svcAct('${s.active?'stop':'start'}','${esc(s.name)}')">${s.active?'stop':'start'}</button>
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
 
-async function svcAction(action,name){
-  const r=await fetch('/api/service',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,name})});
+async function svcAct(action,name){
+  const r=await fetch('/api/service',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({action,name})});
   const d=await r.json();
-  if(d.ok){toast(`${action} ${name}`);setTimeout(loadServices,1500);}else toast(d.msg||'Failed','err');
+  if(d.ok){toast(`${name}: ${action}`,'ok');setTimeout(loadServices,1200);}
+  else toast(d.msg||'Failed','err');
 }
 
-// ── Settings ──────────────────────────────────
-const SETTINGS_GROUPS = [
-  {title:'Panel', fields:[
-    {k:'panel_api_url', label:'Panel API Base URL', type:'text'},
-    {k:'api_token',     label:'API Token',          type:'password'},
-  ]},
-  {title:'GitHub', fields:[
-    {k:'github_user',   label:'Username',   type:'text'},
-    {k:'github_repo',   label:'Repo',       type:'text'},
-    {k:'github_branch', label:'Branch',     type:'text'},
-    {k:'deploy_method', label:'Method (token/ssh)', type:'text'},
-    {k:'github_token',  label:'Token',      type:'password'},
-    {k:'ssh_key_path',  label:'SSH Key Path', type:'text'},
-  ]},
-  {title:'Sync', fields:[
-    {k:'sync_interval', label:'Sync Interval (seconds)', type:'number', note:'Or change live in the Services tab'},
-  ]},
-  {title:'Web UI', fields:[
-    {k:'ui_port', label:'Port',     type:'number', note:'Requires service restart'},
-    {k:'ui_user', label:'Username', type:'text'},
-    {k:'ui_pass', label:'Password', type:'password'},
-  ]},
-  {title:'Subscriptions', fields:[
-    {k:'subs_dir',      label:'Subs folder name in repo', type:'text', note:'Folder where .txt files are stored (e.g. subs)'},
-    {k:'filename_mode', label:'Filename mode',             type:'text', note:'random — secure random string   |   email — user email as filename'},
-    {k:'filename_length',label:'Random filename length',  type:'number'},
-  ]},
-  {title:'Nginx & Domain', fields:[
-    {k:'access_mode', label:'Access Mode', type:'text', note:'1 = IP only   2 = domain via nginx'},
-    {k:'domain',      label:'Domain Name', type:'text', note:'e.g. sub.example.com  —  must point to this server IP'},
-  ]},
+// ── Settings ─────────────────────────────────
+const SECTIONS = {
+  panel:{
+    title:'Panel Connection',
+    desc:'Your 3x-ui panel API credentials.',
+    fields:[
+      {k:'panel_api_url',label:'Panel base URL',type:'text',
+       note:'Full URL with port and optional path. e.g. https://panel.example.com:2053/path'},
+      {k:'api_token',label:'API bearer token',type:'password',
+       note:'Panel → Settings → Authentication → API token'},
+    ]
+  },
+  github:{
+    title:'GitHub Repository',
+    desc:'Where subscription files are pushed.',
+    fields:[
+      {k:'github_user',label:'Username',type:'text',note:'Your GitHub account name'},
+      {k:'github_repo',label:'Repository',type:'text',note:'Must be a public repository'},
+      {k:'github_branch',label:'Branch',type:'text',note:'Default: main'},
+      {k:'deploy_method',label:'Deploy method',type:'text',note:'token — GitHub PAT   /   ssh — deploy key'},
+      {k:'github_token',label:'Personal access token',type:'password',note:'Scope: repo (full)'},
+      {k:'ssh_key_path',label:'SSH key path',type:'text',note:'Path to private key on this server'},
+    ]
+  },
+  sync:{
+    title:'Sync Schedule',
+    desc:'How often gitsub fetches from the panel.',
+    fields:[
+      {k:'sync_interval',label:'Sync interval (seconds)',type:'number',
+       note:'Change live in the Services tab too. Restart sync daemon to apply.'},
+    ]
+  },
+  webui:{
+    title:'Web UI',
+    desc:'Dashboard access credentials and port.',
+    fields:[
+      {k:'ui_port',label:'Port',type:'number',note:'Service restart required'},
+      {k:'ui_user',label:'Username',type:'text'},
+      {k:'ui_pass',label:'Password',type:'password'},
+    ]
+  },
+  subs:{
+    title:'Subscriptions',
+    desc:'Control how subscription files are named and stored.',
+    fields:[
+      {k:'subs_dir',label:'Folder name in repo',type:'text',
+       note:'The GitHub folder holding all .txt files (default: subs)'},
+      {k:'filename_mode',label:'Filename mode',type:'text',
+       note:'random — secure random string (recommended)   |   email — user\'s email'},
+      {k:'filename_length',label:'Random filename length',type:'number',
+       note:'Characters in the random part (default: 32)'},
+    ]
+  },
+  nginx:{
+    title:'Nginx & Domain',
+    desc:'Configure nginx to serve the dashboard via a custom domain.',
+    fields:[
+      {k:'access_mode',label:'Access mode',type:'text',
+       note:'1 = IP address only   |   2 = domain via nginx proxy'},
+      {k:'domain',label:'Domain name',type:'text',
+       note:'e.g. sub.example.com — must point to this server via DNS A record'},
+    ]
+  },
+};
 
-];
+let cfgCache={}, activeSection='panel';
 
-async function loadSettings(){
+async function initSettings(){
   const r=await fetch('/api/settings');
   if(r.status===401){location='/login';return;}
   const d=await r.json();
-  const wrap=document.getElementById('settings-wrap');
-  wrap.innerHTML=SETTINGS_GROUPS.map(g=>`
-    <div class="set-group">
-      <div class="set-group-title">${g.title}</div>
-      ${g.fields.map(f=>`
-        <div class="set-row">
-          <div>
-            <div class="set-label">${f.label}</div>
-            ${f.note?`<div class="set-note">${f.note}</div>`:''}
-          </div>
-          <input class="set-input" id="s_${f.k}" type="${f.type||'text'}"
-                 value="${f.type==='password'?'':esc(d.cfg[f.k]||'')}"
-                 placeholder="${f.type==='password'?'(unchanged)':''}">
-          <button class="set-save" onclick="saveSetting('${f.k}','${f.type}')">Save</button>
-        </div>`).join('')}
-    </div>`).join('');
+  cfgCache=d.cfg;
+  renderSection(activeSection);
 }
 
-async function saveSetting(key, type){
-  const input=document.getElementById('s_'+key);
-  let val=input.value;
-  if(type==='password'&&!val){toast('No change (empty)');return;}
+function switchSection(id,btn){
+  activeSection=id;
+  document.querySelectorAll('.settings-nav-item').forEach(b=>b.classList.remove('active'));
+  if(btn) btn.classList.add('active');
+  renderSection(id);
+}
+
+function renderSection(id){
+  const sec=SECTIONS[id];
+  if(!sec) return;
+  const content=document.getElementById('settings-content');
+  content.innerHTML=`
+    <h3>${sec.title}</h3>
+    <p class="section-desc">${sec.desc}</p>
+    <div class="field-group">
+      ${sec.fields.map(f=>`
+        <div class="field-row">
+          <div>
+            <div class="field-label">${f.label}</div>
+            ${f.note?`<div class="field-note">${f.note}</div>`:''}
+          </div>
+          <input class="field-input" id="fi_${f.k}"
+            type="${f.type||'text'}"
+            value="${f.type==='password'?'':esc(cfgCache[f.k]||'')}"
+            placeholder="${f.type==='password'?'(unchanged)':''}">
+          <button class="field-save" id="fs_${f.k}"
+            onclick="saveSetting('${f.k}','${f.type}')">Save</button>
+        </div>`).join('')}
+    </div>`;
+}
+
+async function saveSetting(key,type){
+  const inp=document.getElementById('fi_'+key);
+  const btn=document.getElementById('fs_'+key);
+  let val=inp.value.trim();
+  if(type==='password'&&!val){toast('No change — field is empty');return;}
   const r=await fetch('/api/settings',{method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({key,value:val})});
   const d=await r.json();
-  if(d.ok) toast(`Saved: ${key}`);
-  else toast(d.msg||'Save failed','err');
+  if(d.ok){
+    toast(`Saved: ${key}`,'ok');
+    btn.textContent='Saved ✓';btn.classList.add('saved');
+    setTimeout(()=>{btn.textContent='Save';btn.classList.remove('saved')},2000);
+    if(type!=='password') cfgCache[key]=val;
+  } else toast(d.msg||'Save failed','err');
 }
 
-loadData();
+// ── Init ─────────────────────────────────────
+document.getElementById('interval-val').addEventListener('input',()=>{
+  document.getElementById('interval-val').dataset.touched='1';
+});
+loadUsers();
 </script>
-</body></html>"""
+</body>
+</html>"""
 
-# ── Routes ─────────────────────────────────────────────────────────────────
+
+# ── Routes ──────────────────────────────────────────────────────────────────
 @app.route("/login", methods=["GET"])
 def login_page(): return LOGIN_HTML.replace("{error}","")
 
@@ -713,19 +1210,16 @@ def api_data():
 @app.route("/api/sync", methods=["POST"])
 @login_required
 def api_sync():
-    if trigger_sync():
-        return jsonify({"ok": True})
-    return jsonify({"ok": False, "msg": "Already running"}), 409
+    if trigger_sync(): return jsonify({"ok":True})
+    return jsonify({"ok":False,"msg":"Already running"}), 409
 
 @app.route("/api/sync/status")
 @login_required
 def api_sync_status(): return jsonify({"running":_syncing})
+
 @app.route("/api/sync/info")
 @login_required
-def api_sync_info():
-    return jsonify(sync_info())
-
-
+def api_sync_info(): return jsonify(sync_info())
 
 @app.route("/api/rotate", methods=["POST"])
 @login_required
@@ -742,35 +1236,29 @@ def api_rotate():
 @app.route("/api/services")
 @login_required
 def api_services():
-    svcs=["xui-subsync","xui-webui"]
-    return jsonify({"services":[svc_status(s) for s in svcs]})
+    return jsonify({"services":[svc_status(s) for s in ["xui-subsync","xui-webui"]]})
 
 @app.route("/api/service", methods=["POST"])
 @login_required
 def api_service():
     data=request.get_json(silent=True) or {}
     action=data.get("action",""); name=data.get("name","")
-    allowed={"start","stop","restart"}
-    svc_allowed={"xui-subsync","xui-webui"}
-    if action not in allowed or name not in svc_allowed:
+    if action not in {"start","stop","restart"} or name not in {"xui-subsync","xui-webui"}:
         return jsonify({"ok":False,"msg":"Not allowed"}),400
     r=subprocess.run(["systemctl",action,name],capture_output=True,text=True)
     return jsonify({"ok":r.returncode==0,"msg":r.stderr.strip() or None})
 
-EDITABLE = {"panel_api_url","api_token","github_user","github_repo","github_branch",
-            "deploy_method","github_token","ssh_key_path","sync_interval","ui_port",
-            "ui_user","ui_pass","filename_length","filename_mode",
-            "domain","access_mode","subs_dir","filename_mode","filename_length"}
-NUMERIC  = {"sync_interval","ui_port","filename_length"}
+EDITABLE={"panel_api_url","api_token","github_user","github_repo","github_branch",
+          "deploy_method","github_token","ssh_key_path","sync_interval","ui_port",
+          "ui_user","ui_pass","filename_length","filename_mode","domain","access_mode","subs_dir"}
+NUMERIC ={"sync_interval","ui_port","filename_length"}
 
 @app.route("/api/settings")
 @login_required
 def api_settings():
-    cfg=load_cfg()
-    # Mask secrets before sending to browser
-    safe=dict(cfg)
+    cfg=load_cfg(); safe=dict(cfg)
     for k in ("api_token","github_token","ui_pass","flask_secret"):
-        if safe.get(k): safe[k]=""  # send empty — frontend shows placeholder
+        if safe.get(k): safe[k]=""
     return jsonify({"cfg":safe})
 
 @app.route("/api/settings", methods=["POST"])
@@ -786,7 +1274,6 @@ def api_settings_save():
     cfg[key]=val; save_cfg(cfg)
     return jsonify({"ok":True})
 
-# ── Run ────────────────────────────────────────────────────────────────────
 if __name__=="__main__":
     print(f"  gitsub WebUI → http://0.0.0.0:{PORT}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
