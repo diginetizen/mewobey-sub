@@ -49,11 +49,15 @@ echo ""
 # 1. PANEL
 # ════════════════════════════════════════
 section "3x-ui Panel"
-hint "Your panel's full URL including port number."
-hint "Find it in your browser address bar when logged into the panel."
-echo "  Examples:"
-echo "    https://panel.example.com:2053"
-echo "    http://1.2.3.4:54321"
+echo "  Enter your panel's base URL in this format:"
+echo ""
+echo "    domain:port/pathurl     →  https://panel.example.com:2053/xPaTh"
+echo "    domain:port             →  https://panel.example.com:2053"
+echo "    ip:port/pathurl         →  http://1.2.3.4:54321/xPaTh"
+echo "    ip:port                 →  http://1.2.3.4:54321"
+echo ""
+echo "  If your panel URL has a path after the port, include it."
+echo "  If it doesn't, just use domain:port or ip:port."
 echo ""
 read -rp "  Panel base URL: " PANEL_API_URL
 echo ""
@@ -69,8 +73,10 @@ hint "Subscription files will be pushed here as raw text files."
 hint "GitHub username: your account name, e.g. johndoe"
 read -rp "  GitHub username: " GITHUB_USER
 echo ""
-hint "Repo name: the repository to push subs into (must exist)."
-hint "Create one at https://github.com/new  (can be private)"
+hint "Repo name: the repository to push subscription files into."
+hint "⚠  The repo MUST be public. If it is private, your users cannot"
+hint "   download their subscription links — they will get a 404 error."
+hint "Create one at: https://github.com/new  (set visibility to Public)"
 read -rp "  Repository name: " GITHUB_REPO
 echo ""
 read -rp "  Branch [main]: " GITHUB_BRANCH
@@ -544,7 +550,7 @@ server {
 }
 NGINXEOF
     ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/xui-webui
-    nginx -t -q && systemctl reload nginx
+    nginx -t -q && systemctl is-active nginx &>/dev/null && systemctl reload nginx || systemctl start nginx
     ok "Nginx: $domain → port $UI_PORT"
 }
 
