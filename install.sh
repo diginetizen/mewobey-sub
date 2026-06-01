@@ -242,7 +242,7 @@ if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
     read -rp "  Choose [1-4] (default 1): " ACCESS_MODE
     ACCESS_MODE="${ACCESS_MODE:-1}"; echo ""
 
-    if [[ "$ACCESS_MODE" =~ ^[23]$ ]]; then
+    if [[ "$ACCESS_MODE" =~ ^[2]$ ]]; then
         section "Domain Name"
         hint "The domain must already point to this server's IP via DNS."
         hint "Example: sub.example.com  (A record → your server IP)"
@@ -251,66 +251,6 @@ if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
         echo ""
     fi
 
-    if [ "$ACCESS_MODE" = "3" ]; then
-        section "SSL Certificate"
-        hint "How do you want to get the HTTPS certificate?"
-        echo "  [1] Let's Encrypt via Certbot  — free, automatic, recommended"
-        echo "  [2] I have cert files on this server"
-        echo "  [3] Skip SSL for now — I'll add it later"
-        echo ""
-        read -rp "  Choose [1-3] (default 1): " SSL_SRC
-        SSL_SRC="${SSL_SRC:-1}"; echo ""
-
-        if [ "$SSL_SRC" = "1" ]; then
-            SSL_MODE="certbot"
-            hint "Certbot will request a certificate from Let's Encrypt."
-            hint "It needs to briefly listen on a port for domain verification."
-            read -rp "  Certbot challenge port [80]: " CERTBOT_PORT
-            CERTBOT_PORT="${CERTBOT_PORT:-80}"
-            read -rp "  Your email for Let's Encrypt notices [admin@${DOMAIN}]: " SSL_EMAIL
-            SSL_EMAIL="${SSL_EMAIL:-admin@${DOMAIN}}"
-        elif [ "$SSL_SRC" = "2" ]; then
-            SSL_MODE="manual"
-            hint "Provide paths to your existing certificate files."
-            read -rp "  Certificate file path (fullchain.pem): " SSL_CERT
-            read -rp "  Private key file path  (privkey.pem): " SSL_KEY
-            [ ! -f "$SSL_CERT" ] && err "Certificate not found: $SSL_CERT"
-            [ ! -f "$SSL_KEY"  ] && err "Key not found: $SSL_KEY"
-            ok "Certificate files accepted"
-        else
-            SSL_MODE="later"
-            warn "SSL skipped — add it later from the gitsub menu (option 8)"
-        fi
-    fi
-
-    if [ "$ACCESS_MODE" = "4" ]; then
-        section "SSL Certificate for IP"
-        hint "Flask will serve HTTPS directly on port ${UI_PORT}."
-        hint "You need a certificate file (fullchain.pem) and a key file (privkey.pem)."
-        echo ""
-        echo "  [1] Enter the file paths"
-        echo "  [2] Paste certificate content"
-        echo ""
-        read -rp "  Choose [1/2] (default 1): " CERT_SRC
-        CERT_SRC="${CERT_SRC:-1}"; echo ""
-
-        if [ "$CERT_SRC" = "2" ]; then
-            mkdir -p "$INSTALL_DIR/ssl"
-            SSL_CERT="$INSTALL_DIR/ssl/cert.pem"; SSL_KEY="$INSTALL_DIR/ssl/key.pem"
-            info "Paste certificate (fullchain.pem), Ctrl+D when done:"; echo ""
-            cat > "$SSL_CERT"; echo ""
-            info "Paste private key (privkey.pem), Ctrl+D when done:"; echo ""
-            cat > "$SSL_KEY"; chmod 600 "$SSL_KEY"
-            ok "Cert saved to $INSTALL_DIR/ssl/"
-        else
-            read -rp "  Certificate path (fullchain.pem): " SSL_CERT
-            read -rp "  Private key path  (privkey.pem): " SSL_KEY
-            [ ! -f "$SSL_CERT" ] && err "Certificate not found: $SSL_CERT"
-            [ ! -f "$SSL_KEY"  ] && err "Key not found: $SSL_KEY"
-            ok "Certificate files accepted"
-        fi
-        SSL_MODE="manual"
-    fi
 fi
 
 # ════════════════════════════════════════
@@ -348,9 +288,7 @@ if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
     echo "   Dashboard port : $UI_PORT"
     case "$ACCESS_MODE" in
         1) echo "   Access         : IP only (HTTP)" ;;
-        2) echo "   Access         : IP + domain $DOMAIN (HTTP)" ;;
-        3) echo "   Access         : IP + domain $DOMAIN + HTTPS ($SSL_MODE)" ;;
-        4) echo "   Access         : IP with HTTPS (cert files)" ;;
+        2) echo "   Access         : IP + domain $DOMAIN (HTTP via nginx)" ;;
     esac
 fi
 echo ""
@@ -364,7 +302,7 @@ info "Installing system packages..."
 apt-get update -qq
 PKGS="python3 python3-venv python3-pip git"
 [[ "$ACCESS_MODE" =~ ^[23]$ ]] && PKGS="$PKGS nginx"
-[ "$SSL_MODE" = "certbot" ]    && PKGS="$PKGS certbot python3-certbot-nginx"
+
 apt-get install -y $PKGS -qq
 ok "Packages installed"
 
@@ -450,11 +388,6 @@ cat > "$INSTALL_DIR/config.json" <<EOF
   "ui_port":        $UI_PORT,
   "domain":         "$DOMAIN",
   "access_mode":    "$ACCESS_MODE",
-  "ssl_mode":       "$SSL_MODE",
-  "ssl_cert":       "$SSL_CERT",
-  "ssl_key":        "$SSL_KEY",
-  "ssl_email":      "$SSL_EMAIL",
-  "certbot_port":   "$CERTBOT_PORT",
 
   "subs_dir":        "$SUBS_DIR_NAME",
   "filename_length": 32,
@@ -531,8 +464,13 @@ ok "Services started"
 # ── nginx / SSL ─────────────────────────────────
 write_nginx_conf() {
     local domain="$1"
+    # Remove the default nginx site that Ubuntu ships — it conflicts
+    rm -f /etc/nginx/sites-enabled/default
+
+    # Remove any other config already using this domain
     CONFLICTS=$(grep -rl "server_name.*${domain}" /etc/nginx/sites-enabled/ 2>/dev/null | grep -v xui-webui || true)
     [ -n "$CONFLICTS" ] && echo "$CONFLICTS" | xargs rm -f && info "Removed conflicting nginx configs"
+
     cat > "$NGINX_CONF" <<NGINXEOF
 server {
     listen 80;
@@ -550,8 +488,18 @@ server {
 }
 NGINXEOF
     ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/xui-webui
-    nginx -t -q && systemctl is-active nginx &>/dev/null && systemctl reload nginx || systemctl start nginx
-    ok "Nginx: $domain → port $UI_PORT"
+
+    # Enable and start nginx first, then test config and reload
+    systemctl enable nginx --quiet
+    systemctl start  nginx 2>/dev/null || true
+
+    if nginx -t -q 2>/dev/null; then
+        systemctl reload nginx
+        ok "Nginx: $domain → port $UI_PORT"
+    else
+        warn "Nginx config test failed — check: nginx -t"
+        nginx -t   # show the actual error
+    fi
 }
 
 if [ "$ACCESS_MODE" = "2" ] && [ -n "$DOMAIN" ]; then
@@ -560,46 +508,6 @@ if [ "$ACCESS_MODE" = "2" ] && [ -n "$DOMAIN" ]; then
         ufw allow 80/tcp --comment "gitsub nginx" >/dev/null 2>&1 || true
 fi
 
-if [ "$ACCESS_MODE" = "3" ] && [ -n "$DOMAIN" ]; then
-    write_nginx_conf "$DOMAIN"
-    if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
-        ufw allow 80/tcp  >/dev/null 2>&1 || true
-        ufw allow 443/tcp >/dev/null 2>&1 || true
-    fi
-
-    if [ "$SSL_MODE" = "certbot" ]; then
-        info "Running Certbot for $DOMAIN (challenge port: $CERTBOT_PORT)..."
-        CERTBOT_ARGS="--nginx -d $DOMAIN --non-interactive --agree-tos -m $SSL_EMAIL"
-        [ "$CERTBOT_PORT" != "80" ] && CERTBOT_ARGS="$CERTBOT_ARGS --http-01-port $CERTBOT_PORT"
-        # shellcheck disable=SC2086
-        certbot $CERTBOT_ARGS \
-            && ok "SSL certificate installed — https://$DOMAIN is live" \
-            || warn "Certbot failed. Run manually: certbot --nginx -d $DOMAIN"
-        grep -q "X-Forwarded-Proto" "$NGINX_CONF" || \
-            sed -i "s|proxy_pass.*127.*|&\n        proxy_set_header X-Forwarded-Proto \$scheme;|" "$NGINX_CONF" 2>/dev/null || true
-        nginx -t -q && systemctl reload nginx 2>/dev/null || true
-
-    elif [ "$SSL_MODE" = "manual" ]; then
-        cat >> "$NGINX_CONF" <<SSLEOF
-
-server {
-    listen 443 ssl;
-    server_name ${DOMAIN};
-    ssl_certificate     ${SSL_CERT};
-    ssl_certificate_key ${SSL_KEY};
-    location / {
-        proxy_pass           http://127.0.0.1:${UI_PORT};
-        proxy_set_header     Host \$host;
-        proxy_set_header     X-Forwarded-Proto https;
-        proxy_read_timeout   60;
-        proxy_http_version   1.1;
-    }
-}
-SSLEOF
-        nginx -t -q && systemctl reload nginx
-        ok "SSL configured via cert files for $DOMAIN"
-    fi
-fi
 
 # ── Done ────────────────────────────────────────
 SERVER_IP=$(hostname -I | awk '{print $1}')
@@ -613,20 +521,12 @@ echo ""
 
 if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
     echo -e "  ${C}Dashboard URLs:${RS}"
-    # Mode 4 = HTTPS on IP
-    if [ "$ACCESS_MODE" = "4" ] && [ -n "$SSL_CERT" ]; then
-        echo "    https://$SERVER_IP:$UI_PORT"
-    else
-        echo "    http://$SERVER_IP:$UI_PORT"
-    fi
+    echo "    http://$SERVER_IP:$UI_PORT"
     # Domain HTTP — modes 2 and 3
     if [[ "$ACCESS_MODE" =~ ^[23]$ ]] && [ -n "$DOMAIN" ]; then
         echo "    http://$DOMAIN:$UI_PORT"
     fi
-    # Domain HTTPS — mode 3 with SSL active
-    if [ "$ACCESS_MODE" = "3" ] && [ -n "$DOMAIN" ] && [ "$SSL_MODE" != "later" ]; then
-        echo "    https://$DOMAIN"
-    fi
+
     echo ""
 fi
 
