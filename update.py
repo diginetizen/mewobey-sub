@@ -1,828 +1,1279 @@
 #!/usr/bin/env python3
-"""gitsub — XUI Subscription Sync Engine"""
+"""gitsub WebUI — Dashboard with settings, mobile-friendly"""
 
-import os, sys, json, time, hashlib, secrets, string, subprocess, logging, re
+import os, sys, json, secrets, subprocess, threading, time
 from pathlib import Path
 from datetime import datetime
-import requests
+from functools import wraps
+from flask import Flask, jsonify, request, redirect, session
 
-# ── Paths ──────────────────────────────────────────────────────────────────
 BASE_DIR    = Path(__file__).resolve().parent
-CONFIG_FILE = BASE_DIR / "config.json"
 SUBMAP_FILE = BASE_DIR / "submap.json"
-LOG_DIR     = BASE_DIR / "logs"
-LOG_DIR.mkdir(exist_ok=True)
+CONFIG_FILE = BASE_DIR / "config.json"
 
-# ── Logging ────────────────────────────────────────────────────────────────
-log = logging.getLogger("gitsub")
-log.setLevel(logging.DEBUG)
-_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
-for _path, _lvl in [(LOG_DIR/"sync.log", logging.DEBUG), (LOG_DIR/"error.log", logging.ERROR)]:
-    _h = logging.FileHandler(_path); _h.setLevel(_lvl); _h.setFormatter(_fmt); log.addHandler(_h)
-_sh = logging.StreamHandler(); _sh.setFormatter(_fmt); log.addHandler(_sh)
+app  = Flask(__name__)
+PORT = int(os.getenv("PORT", 2086))
 
-# ── Colors ─────────────────────────────────────────────────────────────────
-_ANSI = re.compile(r'\x1b\[[0-9;]*m')
-def _strip(s): return _ANSI.sub('', s)
-def _vlen(s):  return len(_strip(s))
-C="\033[0;36m"; G="\033[0;32m"; Y="\033[1;33m"; R="\033[0;31m"
-B="\033[1m";    D="\033[2m";    RS="\033[0m"
-def cyan(s):   return f"{C}{s}{RS}"
-def green(s):  return f"{G}{s}{RS}"
-def yellow(s): return f"{Y}{s}{RS}"
-def red(s):    return f"{R}{s}{RS}"
-def bold(s):   return f"{B}{s}{RS}"
-def dim(s):    return f"{D}{s}{RS}"
-
-# ── Config ─────────────────────────────────────────────────────────────────
-class Config:
-    def __init__(self):
-        if not CONFIG_FILE.exists():
-            print(red("config.json not found. Run install.sh first.")); sys.exit(1)
-        with open(CONFIG_FILE) as f: d = json.load(f)
-        self._raw          = d
-        self.panel_api_url = d.get("panel_api_url", d.get("panel_url","")).rstrip("/")
-        self.api_token     = d.get("api_token","")
-        self.github_user   = d.get("github_user","")
-        self.github_repo   = d.get("github_repo","")
-        self.github_branch = d.get("github_branch","main")
-        self.deploy_method = d.get("deploy_method","token")
-        self.github_token  = d.get("github_token","")
-        self.ssh_key_path  = d.get("ssh_key_path","/root/.ssh/gitsub_deploy")
-        self.filename_len  = int(d.get("filename_length", 32))
-        self.filename_mode = d.get("filename_mode","random")
-        self.subs_dir      = d.get("subs_dir","subs")
-        self.sync_interval = int(d.get("sync_interval", 21600))
-        self.ui_user       = d.get("ui_user","admin")
-        self.ui_pass       = d.get("ui_pass","")
-        self.ui_port       = int(d.get("ui_port", 2086))
-        self.domain        = d.get("domain","")
-        self.access_mode   = d.get("access_mode","1")
-        self.timeout       = 20
-        self.retries       = 3
-
-    @property
-    def subs_path(self): return BASE_DIR / self.subs_dir
-
-    @property
-    def raw_base_url(self):
-        return f"https://raw.githubusercontent.com/{self.github_user}/{self.github_repo}/{self.github_branch}/{self.subs_dir}"
-
-def save_config(data: dict):
-    with open(CONFIG_FILE,"w") as f: json.dump(data,f,indent=2)
-    CONFIG_FILE.chmod(0o600)
-
-def load_config() -> dict:
+def load_cfg() -> dict:
     if not CONFIG_FILE.exists(): return {}
     with open(CONFIG_FILE) as f: return json.load(f)
 
-# ── Utils ──────────────────────────────────────────────────────────────────
-ALPHABET = string.ascii_letters + string.digits
+def save_cfg(d: dict):
+    with open(CONFIG_FILE,"w") as f: json.dump(d,f,indent=2)
+    CONFIG_FILE.chmod(0o600)
 
-def gen_filename(n: int) -> str:
-    return "".join(secrets.choice(ALPHABET) for _ in range(n)) + ".txt"
+def load_submap() -> dict:
+    if not SUBMAP_FILE.exists(): return {}
+    with open(SUBMAP_FILE) as f: return json.load(f)
 
-def hash_content(links: list) -> str:
-    return hashlib.sha256("\n".join(sorted(links)).encode()).hexdigest()
+def fmtts(epoch):
+    try: return datetime.utcfromtimestamp(int(epoch)).strftime("%Y-%m-%d %H:%M UTC")
+    except: return "—"
 
-def email_to_filename(email: str) -> str:
-    safe = re.sub(r'[^a-zA-Z0-9._-]', '_', email.lower())
-    safe = safe.replace("@","_at_")
-    return safe + ".txt"
+def get_or_create_secret() -> str:
+    cfg = load_cfg()
+    if cfg.get("flask_secret"): return cfg["flask_secret"]
+    s = secrets.token_hex(32); cfg["flask_secret"]=s; save_cfg(cfg); return s
 
-# ── API ────────────────────────────────────────────────────────────────────
-class API:
-    def __init__(self, cfg):
-        self.cfg = cfg
-    def _get(self, url):
-        hdrs = {"Authorization": f"Bearer {self.cfg.api_token}"}
-        last = None
-        for i in range(1, self.cfg.retries+1):
-            try:
-                r = requests.get(url, headers=hdrs, timeout=self.cfg.timeout)
-                r.raise_for_status(); return r.json()
-            except Exception as e:
-                last = e; log.warning(f"Attempt {i}: {e}"); time.sleep(2*i)
-        raise RuntimeError(f"All retries failed: {last}")
-    def get_clients(self):
-        return self._get(f"{self.cfg.panel_api_url}/panel/api/clients/list").get("obj",[])
-    def get_sub_links(self, sub_id):
-        return self._get(f"{self.cfg.panel_api_url}/panel/api/clients/subLinks/{sub_id}").get("obj",[])
+app.secret_key = get_or_create_secret()
+app.config.update(SESSION_COOKIE_SECURE=False, SESSION_COOKIE_HTTPONLY=True,
+                   SESSION_COOKIE_SAMESITE="Lax")
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1, x_for=1)
 
-# ── Store ──────────────────────────────────────────────────────────────────
-class Store:
-    def __init__(self, cfg=None):
-        subs_name = cfg.subs_dir if cfg else load_config().get("subs_dir","subs")
-        self._subs = BASE_DIR / subs_name
-        self._subs.mkdir(exist_ok=True)
+def check_auth(u, p) -> bool:
+    cfg = load_cfg()
+    eu  = cfg.get("ui_user","admin")
+    ep  = cfg.get("ui_pass","")
+    if not ep: return True
+    return u==eu and p==ep
 
-    def load(self) -> dict:
-        if not SUBMAP_FILE.exists(): return {}
-        with open(SUBMAP_FILE) as f: return json.load(f)
+def login_required(f):
+    @wraps(f)
+    def dec(*a, **kw):
+        if not session.get("ok"):
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "unauthorized"}), 401
+            return redirect("/login")
+        return f(*a, **kw)
+    return dec
 
-    def save(self, data: dict):
-        with open(SUBMAP_FILE,"w") as f: json.dump(data,f,indent=2)
+_syncing = False
+_sync_lock = threading.Lock()
 
-    def write_sub(self, fn: str, links: list):
-        (self._subs/fn).write_text("\n".join(links))
+def trigger_sync():
+    global _syncing
+    with _sync_lock:
+        if _syncing: return False
+        _syncing = True
+    def _r():
+        global _syncing
+        try: subprocess.run([sys.executable, str(BASE_DIR/"update.py"),"sync"], cwd=BASE_DIR)
+        finally: _syncing = False
+    threading.Thread(target=_r,daemon=True).start(); return True
 
-    def delete_sub(self, fn: str):
-        p = self._subs/fn
-        if p.exists(): p.unlink(); log.info(f"Deleted file: {fn}")
+def svc_status(name) -> dict:
+    r = subprocess.run(["systemctl","is-active",name], capture_output=True, text=True)
+    active = r.stdout.strip() == "active"
+    r2 = subprocess.run(
+        ["systemctl","show",name,"--no-page",
+         "--property=ActiveState,SubState,ActiveEnterTimestamp,ExecMainPID,MemoryCurrent"],
+        capture_output=True, text=True)
+    props = {}
+    for line in r2.stdout.strip().splitlines():
+        if "=" in line: k,v = line.split("=",1); props[k] = v
+    mem = props.get("MemoryCurrent","")
+    try:    mem_mb = f"{int(mem)/1024/1024:.1f} MB"
+    except: mem_mb = "—"
+    return {
+        "name":   name,
+        "active": active,
+        "state":  r.stdout.strip(),
+        "since":  props.get("ActiveEnterTimestamp","").replace("n/a","").strip() or "—",
+        "pid":    props.get("ExecMainPID","—"),
+        "memory": mem_mb,
+    }
 
-    def rename_sub(self, old_fn: str, new_fn: str):
-        old = self._subs/old_fn; new = self._subs/new_fn
-        if old.exists():
-            new.write_text(old.read_text()); old.unlink()
-            log.info(f"Renamed: {old_fn} → {new_fn}")
+def sync_info() -> dict:
+    cfg    = load_cfg()
+    submap = load_submap()
+    interval = int(cfg.get("sync_interval", 21600))
+    last_ts = max((v.get("updated",0) for v in submap.values()), default=0)
+    r = subprocess.run(["systemctl","is-active","xui-subsync"], capture_output=True, text=True)
+    daemon_active = r.stdout.strip() == "active"
+    next_ts = (last_ts + interval) if (daemon_active and last_ts) else None
+    now = int(time.time())
+    if next_ts and next_ts > now:
+        remaining = next_ts - now
+        h, m = divmod(remaining // 60, 60)
+        countdown = f"{h}h {m}m" if h else f"{m}m {remaining%60}s"
+    elif daemon_active and last_ts:
+        countdown = "syncing soon"
+    else:
+        countdown = "—"
+    return {
+        "mode":          "daemon (auto)" if daemon_active else "manual only",
+        "daemon_active": daemon_active,
+        "interval":      interval,
+        "interval_fmt":  _fmt_interval(interval),
+        "last_sync":     fmtts(last_ts) if last_ts else "never",
+        "last_ts":       last_ts,
+        "next_sync":     fmtts(next_ts) if next_ts else "—",
+        "countdown":     countdown,
+        "syncing_now":   _syncing,
+    }
 
-# ── Git ────────────────────────────────────────────────────────────────────
-class Git:
-    def __init__(self, cfg): self.cfg = cfg
+def _fmt_interval(s):
+    s = int(s)
+    if s >= 3600: return f"{s//3600}h {(s%3600)//60}m" if s%3600 else f"{s//3600}h"
+    if s >= 60:   return f"{s//60}m"
+    return f"{s}s"
 
-    def _run(self, args, check=True):
-        r = subprocess.run(args, cwd=BASE_DIR, capture_output=True, text=True)
-        if check and r.returncode != 0:
-            raise RuntimeError(f"git {args[1]}: {(r.stderr or r.stdout).strip()}")
-        return r
 
-    def _remote_url(self):
-        if self.cfg.deploy_method == "ssh":
-            return f"git@github-gitsub:{self.cfg.github_user}/{self.cfg.github_repo}.git"
-        token = self.cfg.github_token
-        user  = self.cfg.github_user
-        repo  = self.cfg.github_repo
-        if not token:
-            raise RuntimeError("GitHub token is empty. Set it in settings.")
-        if not user or not repo:
-            raise RuntimeError("GitHub username or repo name is empty. Check settings.")
-        return f"https://{token}@github.com/{user}/{repo}.git"
+# ────────────────────────────────────────────────────────────────────────────
+# HTML
+# ────────────────────────────────────────────────────────────────────────────
 
-    def ensure_remote(self):
-        """Always re-set remote URL in case user/repo/token changed."""
-        url = self._remote_url()
-        r = self._run(["git","remote","get-url","origin"], check=False)
-        if r.returncode != 0:
-            self._run(["git","remote","add","origin",url])
-        else:
-            self._run(["git","remote","set-url","origin",url])
-
-    def pull_rebase(self):
-        try:
-            self._run(["git","fetch","origin",self.cfg.github_branch])
-            r = self._run(["git","rebase",f"origin/{self.cfg.github_branch}"], check=False)
-            if r.returncode != 0:
-                self._run(["git","rebase","--abort"], check=False)
-                # Hard reset to remote — safe for subs-only repo
-                self._run(["git","reset","--hard",f"origin/{self.cfg.github_branch}"])
-                log.warning("Rebase conflict: reset to remote HEAD")
-        except Exception as e:
-            log.warning(f"pull_rebase skipped: {e}")
-
-    def push(self) -> bool:
-        self.ensure_remote()
-        subs_dir = self.cfg.subs_dir
-        self._run(["git","add",f"{subs_dir}/"])
-        if not self._run(["git","status","--porcelain"],check=False).stdout.strip():
-            log.info("Nothing to push"); return False
-        self.pull_rebase()
-        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-        self._run(["git","commit","-m",f"sync {ts}"])
-        result = subprocess.run(
-            ["git","push",self._remote_url(),self.cfg.github_branch],
-            cwd=BASE_DIR, capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            err = (result.stderr or result.stdout).strip()
-            raise RuntimeError(f"Push failed: {err or 'no error message — check token/repo name'}")
-        log.info("Git push OK"); return True
-
-# ── Engine ─────────────────────────────────────────────────────────────────
-class Engine:
-    def __init__(self):
-        self.cfg   = Config()
-        self.api   = API(self.cfg)
-        self.store = Store(self.cfg)
-        self.git   = Git(self.cfg)
-
-    def _desired_filename(self, email: str, existing: str | None) -> str:
-        """
-        Determine the correct filename for a user.
-        If mode is 'email': use email-based name.
-        If mode is 'random': use existing if present, else generate.
-        Also handles mode switch: if existing filename doesn't match
-        the current mode, return the new desired name so it gets renamed.
-        """
-        mode = self.cfg.filename_mode
-        if mode == "email" and email and email != "unknown":
-            desired = email_to_filename(email)
-        else:
-            desired = existing if existing else gen_filename(self.cfg.filename_len)
-
-        # If existing doesn't match desired (mode was switched), rename
-        if existing and existing != desired:
-            self.store.rename_sub(existing, desired)
-            log.info(f"Mode switch rename: {existing} → {desired}")
-
-        return desired
-
-    def sync(self):
-        log.info("─── Sync started ───")
-        submap  = self.store.load()
-        clients = self.api.get_clients()
-        log.info(f"Found {len(clients)} clients")
-
-        seen    = set()
-        new_map = {}
-        # Track filenames to detect duplicates
-        used_filenames: dict[str, str] = {}  # filename → sub_id
-
-        for client in clients:
-            sub_id = client.get("subId","").strip()
-            email  = client.get("email","unknown")
-            if not sub_id: continue
-            seen.add(sub_id)
-
-            try:
-                links = self.api.get_sub_links(sub_id)
-            except Exception as e:
-                log.error(f"Links failed for {email}: {e}")
-                if sub_id in submap: new_map[sub_id] = submap[sub_id]
-                continue
-
-            if not links: continue
-
-            old      = submap.get(sub_id)
-            old_fn   = old["filename"] if old else None
-            new_fn   = self._desired_filename(email, old_fn)
-
-            # Duplicate check: if another sub_id already claimed this filename
-            if new_fn in used_filenames and used_filenames[new_fn] != sub_id:
-                log.warning(f"Filename collision for {email}: {new_fn} already used — generating random name")
-                new_fn = gen_filename(self.cfg.filename_len)
-
-            used_filenames[new_fn] = sub_id
-
-            new_hash = hash_content(links)
-            # Only rewrite file if content changed OR filename changed
-            if old and old.get("hash") == new_hash and old_fn == new_fn:
-                new_map[sub_id] = old
-                continue
-
-            self.store.write_sub(new_fn, links)
-            new_map[sub_id] = {
-                "email":      email,
-                "filename":   new_fn,
-                "hash":       new_hash,
-                "raw_url":    f"{self.cfg.raw_base_url}/{new_fn}",
-                "updated":    int(time.time()),
-                "updated_ts": datetime.utcnow().isoformat(),
-                "filename_mode": self.cfg.filename_mode,
-            }
-            log.info(f"Updated: {email} → {new_fn}")
-
-        # Remove deleted clients — delete both map entry and file
-        for sid, v in submap.items():
-            if sid not in seen:
-                self.store.delete_sub(v["filename"])
-                log.info(f"Removed: {v.get('email', sid)}")
-
-        self.store.save(new_map)
-
-        try:
-            self.git.push()
-        except Exception as e:
-            log.error(f"Push failed: {e}")
-            print(red(f"\n  Push error: {e}"))
-            print(yellow("  Tip: run 'gitsub settings edit' and check github_user, github_repo, github_token"))
-
-        log.info("─── Sync complete ───")
-        return new_map
-
-    def lookup(self, q):
-        q = q.strip().lower()
-        return [(k,v) for k,v in self.store.load().items()
-                if q in v.get("email","").lower() or q in k.lower()]
-
-    def rotate(self, q):
-        submap = self.store.load(); q = q.strip().lower(); rotated = []
-        for sid, v in submap.items():
-            if q in v.get("email","").lower() or q in sid.lower():
-                new_fn = gen_filename(self.cfg.filename_len)
-                self.store.rename_sub(v["filename"], new_fn)
-                v["filename"] = new_fn
-                v["raw_url"]  = f"{self.cfg.raw_base_url}/{new_fn}"
-                v["hash"]     = ""
-                submap[sid]   = v
-                rotated.append((sid, v))
-        if rotated:
-            self.store.save(submap)
-            try: self.git.push()
-            except Exception as e: log.error(f"Push after rotate failed: {e}")
-        return rotated
-
-# ── Settings ───────────────────────────────────────────────────────────────
-SETTINGS = {
-    "panel_api_url":   "Panel API Base URL",
-    "api_token":       "API Token",
-    "github_user":     "GitHub Username",
-    "github_repo":     "GitHub Repo",
-    "github_branch":   "GitHub Branch",
-    "deploy_method":   "Deploy Method (token/ssh)",
-    "github_token":    "GitHub Personal Access Token",
-    "ssh_key_path":    "SSH Key Path",
-    "sync_interval":   "Sync Interval (seconds)",
-    "ui_port":         "Web UI Port",
-    "ui_user":         "Web UI Username",
-    "ui_pass":         "Web UI Password",
-    "domain":          "Domain Name (for nginx)",
-    "access_mode":     "Access Mode (1=IP  2=IP+domain)",
-    "subs_dir":        "Subs Folder Name in Repo",
-    "filename_length": "Filename Random Length",
-    "filename_mode":   "Filename Mode (random / email)",
+LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>gitsub</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#080b10;--card:#0f1318;--brd:#1a2030;
+  --acc:#3ECFCF;--txt:#dde3ee;--sub:#5a6478;
+  --err:#f05;--font-mono:'DM Mono',monospace;--font-sans:'DM Sans',sans-serif;
 }
-NUMERIC = {"sync_interval","ui_port","filename_length"}
-SECRET  = {"api_token","github_token","ui_pass"}
+body{
+  background:var(--bg);color:var(--txt);font-family:var(--font-sans);
+  min-height:100vh;display:flex;align-items:center;justify-content:center;
+  padding:20px;
+}
+/* Subtle grid background */
+body::before{
+  content:'';position:fixed;inset:0;
+  background-image:linear-gradient(var(--brd) 1px,transparent 1px),
+                   linear-gradient(90deg,var(--brd) 1px,transparent 1px);
+  background-size:40px 40px;opacity:.35;pointer-events:none;z-index:0;
+}
+.card{
+  position:relative;z-index:1;
+  background:var(--card);border:1px solid var(--brd);
+  border-radius:12px;padding:40px 36px;width:100%;max-width:360px;
+  box-shadow:0 24px 64px rgba(0,0,0,.6);
+}
+.brand{
+  display:flex;align-items:center;gap:10px;margin-bottom:32px;
+}
+.brand-icon{
+  width:36px;height:36px;background:var(--acc);border-radius:8px;
+  display:flex;align-items:center;justify-content:center;
+  font-family:var(--font-mono);font-size:14px;font-weight:500;color:#080b10;
+  flex-shrink:0;
+}
+.brand-name{font-family:var(--font-mono);font-size:18px;font-weight:500;color:var(--txt)}
+.brand-name span{color:var(--sub)}
+.field{margin-bottom:18px}
+label{
+  display:block;font-size:11px;font-weight:500;letter-spacing:.06em;
+  color:var(--sub);text-transform:uppercase;margin-bottom:6px;
+}
+input{
+  width:100%;background:#060a0f;border:1px solid var(--brd);
+  color:var(--txt);font-family:var(--font-mono);font-size:13px;
+  padding:10px 14px;border-radius:8px;outline:none;
+  transition:border-color .2s,box-shadow .2s;
+}
+input:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(62,207,207,.12)}
+.btn{
+  width:100%;margin-top:4px;padding:11px;
+  background:var(--acc);border:none;border-radius:8px;
+  font-family:var(--font-sans);font-size:14px;font-weight:600;
+  color:#080b10;cursor:pointer;transition:opacity .15s,transform .1s;
+  letter-spacing:.01em;
+}
+.btn:hover{opacity:.88}
+.btn:active{transform:scale(.98)}
+.err{
+  font-size:12px;color:var(--err);background:rgba(255,0,85,.08);
+  border:1px solid rgba(255,0,85,.2);border-radius:6px;
+  padding:9px 12px;margin-bottom:16px;text-align:center;
+}
+.divider{height:1px;background:var(--brd);margin:24px 0}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="brand">
+    <div class="brand-icon">gs</div>
+    <div class="brand-name">git<span>/</span>sub</div>
+  </div>
+  {error}
+  <form method="POST" action="/login">
+    <div class="field">
+      <label>Username</label>
+      <input type="text" name="username" autocomplete="username" autofocus>
+    </div>
+    <div class="field">
+      <label>Password</label>
+      <input type="password" name="password" autocomplete="current-password">
+    </div>
+    <button class="btn" type="submit">Sign in</button>
+  </form>
+</div>
+</body>
+</html>"""
 
-def show_settings():
-    cfg = load_config()
-    print(f"\n{bold('Current Settings')}  {dim(str(CONFIG_FILE))}\n")
-    for i,(k,label) in enumerate(SETTINGS.items(),1):
-        v = str(cfg.get(k,""))
-        if k in SECRET and v: v = v[:4]+"●●●●" if len(v)>4 else "●●●●"
-        print(f"  {dim(str(i).rjust(2))}  {label:<38}  {v or dim('(not set)')}")
-    print()
 
-def edit_settings():
-    cfg  = load_config()
-    keys = list(SETTINGS.keys())
-    print(f"\n{bold('Edit Settings')}\n")
-    for i,(k,label) in enumerate(SETTINGS.items(),1):
-        v = str(cfg.get(k,""))
-        if k in SECRET and v: v = v[:4]+"●●●"
-        print(f"  {cyan(str(i).rjust(2))}  {label:<38}  {dim(v)}")
-    print(f"  {cyan(' 0')}  Cancel\n")
-    raw = input("  Choose: ").strip()
-    if not raw.isdigit() or int(raw)==0 or int(raw)>len(keys):
-        print("Cancelled."); return
-    idx=int(raw)-1; k=keys[idx]; label=SETTINGS[k]
-    print(f"\n  Changing : {bold(label)}\n  Current  : {dim(str(cfg.get(k,'')))} \n")
-    if k in SECRET:
-        import getpass; v=getpass.getpass("  New value (hidden): ")
-    else:
-        v=input("  New value: ").strip()
-    if not v: print("  No change."); return
-    if k in NUMERIC:
-        try: v=int(v)
-        except: print(red("  Must be a number.")); return
-    cfg[k]=v; save_config(cfg)
-    # If GitHub repo details changed, update git remote immediately
-    if k in ("github_user","github_repo","github_token","deploy_method","ssh_key_path"):
-        try:
-            cfg_obj = Config()
-            Git(cfg_obj).ensure_remote()
-            print(green("  Git remote updated."))
-        except Exception as e:
-            print(yellow(f"  Git remote update failed: {e}"))
-    print(green("\n  Saved."))
-    _offer_restart(k)
+DASH_HTML = r"""<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>gitsub dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+/* ─── Tokens ─────────────────────────────────── */
+:root{
+  --bg:#080b10;
+  --surf:#0f1318;
+  --surf2:#141920;
+  --brd:#1a2030;
+  --brd2:#222a38;
+  --acc:#3ECFCF;
+  --acc-dim:rgba(62,207,207,.12);
+  --acc-glow:rgba(62,207,207,.25);
+  --blue:#4D9FFF;
+  --blue-dim:rgba(77,159,255,.12);
+  --warn:#F5A623;
+  --err:#FF3366;
+  --green:#2ECC8D;
+  --txt:#dde3ee;
+  --txt2:#8a95a8;
+  --txt3:#5a6478;
+  --mono:'DM Mono',monospace;
+  --sans:'DM Sans',sans-serif;
+  --r:8px;
+  --r-sm:5px;
+  --shadow:0 4px 24px rgba(0,0,0,.5);
+  --shadow-lg:0 16px 64px rgba(0,0,0,.6);
+}
+[data-theme="light"]{
+  --bg:#f0f2f5;--surf:#ffffff;--surf2:#f7f8fa;--brd:#e0e4ec;--brd2:#d0d5e0;
+  --txt:#1a2030;--txt2:#4a5568;--txt3:#8a95a8;--shadow:0 2px 12px rgba(0,0,0,.08);
+}
 
-def _offer_restart(changed_key=""):
-    if changed_key in ("sync_interval","panel_api_url","api_token","github_user","github_repo",
-                       "github_branch","deploy_method","github_token","ssh_key_path","filename_mode","subs_dir"):
-        sug = "2"
-    elif changed_key in ("ui_port","ui_user","ui_pass","domain","access_mode"):
-        sug = "3"
-    else:
-        sug = "1"
-    print(f"\n  Restart needed? (suggested: {cyan(sug)})")
-    print(f"  {cyan(' 1')}  Restart both services")
-    print(f"  {cyan(' 2')}  Restart sync daemon only")
-    print(f"  {cyan(' 3')}  Restart web UI only")
-    print(f"  {cyan(' 0')}  Skip\n")
-    c = input("  Choose: ").strip()
-    if c=="1": subprocess.run(["systemctl","restart","xui-subsync","xui-webui"],check=False); print(green("  Restarted both."))
-    elif c=="2": subprocess.run(["systemctl","restart","xui-subsync"],check=False); print(green("  Sync daemon restarted."))
-    elif c=="3": subprocess.run(["systemctl","restart","xui-webui"],check=False); print(green("  Web UI restarted."))
+/* ─── Reset ──────────────────────────────────── */
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  background:var(--bg);color:var(--txt);font-family:var(--sans);
+  font-size:14px;min-height:100vh;line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+}
 
-# ── Nginx config menu ───────────────────────────────────────────────────────
-def nginx_menu():
-    cfg       = load_config()
-    port      = cfg.get("ui_port", 2086)
-    http_port = cfg.get("nginx_http_port", 80)
-    NGINX_CONF = "/etc/nginx/sites-available/xui-webui"
+/* Grid bg for dark mode */
+body::before{
+  content:'';position:fixed;inset:0;
+  background-image:linear-gradient(var(--brd) 1px,transparent 1px),
+                   linear-gradient(90deg,var(--brd) 1px,transparent 1px);
+  background-size:48px 48px;opacity:.2;pointer-events:none;z-index:0;
+  transition:opacity .3s;
+}
+[data-theme="light"] body::before{opacity:0}
 
-    print(f"\n{bold('Nginx / Domain Setup')}\n")
-    print(f"  Current: mode {cfg.get('access_mode','1')}  domain: {cfg.get('domain','none')}  nginx port: {http_port}\n")
-    print(f"  {cyan(' 1')}  IP only — disable nginx for gitsub")
-    print(f"  {cyan(' 2')}  Set up domain → port {port}  (nginx HTTP proxy)")
-    print(f"  {cyan(' 3')}  Show current nginx config")
-    print(f"  {cyan(' 4')}  Reload nginx")
-    print(f"  {cyan(' 5')}  Test nginx config (nginx -t)")
-    print(f"  {cyan(' 6')}  Enable nginx service")
-    print(f"  {cyan(' 0')}  Back\n")
-    choice = input("  Choose: ").strip()
+/* ─── Layout shell ───────────────────────────── */
+#app{position:relative;z-index:1;display:flex;flex-direction:column;min-height:100vh}
 
-    if choice == "0": return
+/* ─── Top bar ────────────────────────────────── */
+.topbar{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:0 24px;height:56px;
+  background:rgba(15,19,24,.8);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--brd);
+  position:sticky;top:0;z-index:100;
+  transition:background .3s;
+}
+[data-theme="light"] .topbar{background:rgba(255,255,255,.9)}
 
-    elif choice == "1":
-        cfg["access_mode"]="1"; cfg["domain"]=""; save_config(cfg)
-        link = Path("/etc/nginx/sites-enabled/xui-webui")
-        if link.exists(): link.unlink()
-        subprocess.run(["systemctl","reload","nginx"],check=False)
-        print(green(f"\n  Done. Dashboard: http://SERVER_IP:{port}"))
+.brand{display:flex;align-items:center;gap:10px;text-decoration:none}
+.brand-icon{
+  width:28px;height:28px;background:var(--acc);border-radius:6px;
+  display:flex;align-items:center;justify-content:center;
+  font-family:var(--mono);font-size:11px;font-weight:500;color:#080b10;flex-shrink:0;
+}
+.brand-name{font-family:var(--mono);font-size:14px;font-weight:500;color:var(--txt)}
+.brand-name em{color:var(--txt3);font-style:normal}
 
-    elif choice == "2":
-        domain = input("  Domain name (e.g. sub.example.com): ").strip()
-        if not domain: print(red("  Domain required.")); return
-        http_port_in = input(f"  Nginx HTTP port [{http_port}]: ").strip()
-        if http_port_in.isdigit(): http_port = int(http_port_in)
-        cfg["nginx_http_port"] = http_port
+.topbar-center{display:flex;align-items:center;gap:4px}
+.tab-btn{
+  font-family:var(--sans);font-size:13px;font-weight:500;
+  padding:6px 14px;border-radius:var(--r-sm);border:none;
+  background:transparent;color:var(--txt2);cursor:pointer;
+  transition:all .15s;white-space:nowrap;
+}
+.tab-btn:hover{background:var(--surf2);color:var(--txt)}
+.tab-btn.active{background:var(--acc-dim);color:var(--acc)}
 
-        if subprocess.run(["which","nginx"],capture_output=True).returncode != 0:
-            print("  Installing nginx...")
-            subprocess.run(["apt-get","install","-y","-qq","nginx"],check=False)
+.topbar-right{display:flex;align-items:center;gap:8px}
 
-        # Remove default site and conflicts
-        Path("/etc/nginx/sites-enabled/default").unlink(missing_ok=True)
-        r = subprocess.run(["grep","-rl",f"server_name.*{domain}","/etc/nginx/sites-enabled/"],
-                            capture_output=True,text=True)
-        for f in r.stdout.strip().splitlines():
-            if f and "xui-webui" not in f: subprocess.run(["rm","-f",f])
+/* Sync pulse indicator */
+.sync-indicator{
+  display:flex;align-items:center;gap:6px;
+  font-family:var(--mono);font-size:11px;color:var(--txt3);
+  padding:4px 10px;border-radius:20px;
+  border:1px solid var(--brd);background:var(--surf);
+}
+.pulse{
+  width:6px;height:6px;border-radius:50%;background:var(--txt3);
+  transition:background .3s;
+}
+.pulse.active{background:var(--warn);animation:blink 1.2s ease-in-out infinite}
+.pulse.ok{background:var(--green)}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
 
-        conf = f"""server {{
-    listen {http_port};
-    server_name {domain};
-    location / {{
-        proxy_pass           http://127.0.0.1:{port};
-        proxy_set_header     Host $host;
-        proxy_set_header     X-Real-IP $remote_addr;
-        proxy_set_header     X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header     X-Forwarded-Proto $scheme;
-        proxy_read_timeout   60;
-        proxy_http_version   1.1;
-        proxy_buffering      off;
-    }}
-}}"""
-        Path(NGINX_CONF).write_text(conf)
-        link = Path("/etc/nginx/sites-enabled/xui-webui")
-        if not link.exists(): link.symlink_to(NGINX_CONF)
+/* ─── Buttons ────────────────────────────────── */
+.btn{
+  font-family:var(--sans);font-size:13px;font-weight:500;
+  padding:7px 16px;border-radius:var(--r-sm);border:1px solid var(--brd);
+  background:var(--surf2);color:var(--txt);cursor:pointer;
+  transition:all .15s;white-space:nowrap;display:inline-flex;align-items:center;gap:6px;
+}
+.btn:hover{border-color:var(--brd2);background:var(--surf);color:var(--txt)}
+.btn.primary{background:var(--acc);border-color:var(--acc);color:#080b10;font-weight:600}
+.btn.primary:hover{opacity:.88}
+.btn.danger{color:var(--err);border-color:rgba(255,51,102,.25);background:transparent}
+.btn.danger:hover{background:rgba(255,51,102,.08);border-color:var(--err)}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--txt2)}
+.btn.ghost:hover{background:var(--surf2);color:var(--txt)}
+.btn.sm{padding:4px 10px;font-size:12px;border-radius:4px}
+.btn.xs{padding:2px 8px;font-size:11px;border-radius:4px;font-family:var(--mono)}
+.btn:disabled{opacity:.35;cursor:not-allowed}
+.btn.ok-flash{color:var(--green);border-color:var(--green)!important}
 
-        subprocess.run(["systemctl","enable","nginx","--quiet"],check=False)
-        subprocess.run(["systemctl","start","nginx"],check=False)
+/* ─── Panels ─────────────────────────────────── */
+.panel{display:none}.panel.active{display:block}
 
-        r = subprocess.run(["nginx","-t"], capture_output=True, text=True)
-        if r.returncode == 0:
-            subprocess.run(["systemctl","reload","nginx"],check=False)
-            cfg["access_mode"]="2"; cfg["domain"]=domain; save_config(cfg)
-            print(green(f"\n  Done. Dashboard:\n    http://SERVER_IP:{port}\n    http://{domain}:{port}"))
-        else:
-            print(red(f"  Nginx config error:\n{r.stderr}"))
+/* ─── Stat strip ─────────────────────────────── */
+.stat-strip{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
+  gap:0;background:var(--brd);border-bottom:1px solid var(--brd);
+}
+.stat-cell{
+  background:var(--surf);padding:14px 20px;
+  transition:background .15s;
+}
+.stat-cell:hover{background:var(--surf2)}
+.stat-label{
+  font-family:var(--mono);font-size:10px;color:var(--txt3);
+  text-transform:uppercase;letter-spacing:.08em;margin-bottom:5px;
+}
+.stat-val{
+  font-family:var(--mono);font-size:18px;font-weight:500;color:var(--acc);
+}
+.stat-val.text{font-size:12px;line-height:1.4;color:var(--txt)}
 
-    elif choice == "3":
-        if Path(NGINX_CONF).exists():
-            print(f"\n{dim(NGINX_CONF)}\n")
-            print(Path(NGINX_CONF).read_text())
-        else:
-            print(yellow("  No config file found."))
+/* ─── Toolbar ────────────────────────────────── */
+.toolbar{
+  display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  padding:12px 20px;border-bottom:1px solid var(--brd);
+  background:var(--surf);
+}
+.search-wrap{flex:1;min-width:200px;position:relative}
+.search-wrap input{
+  width:100%;background:var(--bg);border:1px solid var(--brd);
+  color:var(--txt);font-family:var(--mono);font-size:12px;
+  padding:8px 12px 8px 32px;border-radius:var(--r-sm);outline:none;
+  transition:border-color .2s,box-shadow .2s;
+}
+.search-wrap input:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-glow)}
+.search-icon{
+  position:absolute;left:10px;top:50%;transform:translateY(-50%);
+  color:var(--txt3);font-size:13px;pointer-events:none;
+}
+.count-badge{
+  font-family:var(--mono);font-size:11px;color:var(--txt3);
+  white-space:nowrap;
+}
 
-    elif choice == "4":
-        r = subprocess.run(["systemctl","reload","nginx"], capture_output=True, text=True)
-        print(green("  Reloaded.") if r.returncode==0 else red(f"  Failed: {r.stderr.strip()}"))
+/* ─── Table ──────────────────────────────────── */
+.tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+table{width:100%;border-collapse:collapse;min-width:560px}
+thead{position:sticky;top:56px;z-index:10}
+thead th{
+  font-family:var(--mono);font-size:10px;font-weight:500;
+  text-transform:uppercase;letter-spacing:.08em;color:var(--txt3);
+  text-align:left;padding:10px 20px;
+  background:var(--surf2);border-bottom:1px solid var(--brd);
+  white-space:nowrap;
+}
+tbody tr{border-bottom:1px solid var(--brd);transition:background .1s}
+tbody tr:hover{background:var(--surf2)}
+tbody td{padding:11px 20px;vertical-align:middle}
 
-    elif choice == "5":
-        subprocess.run(["nginx","-t"])
+.cell-email{
+  font-family:var(--sans);font-size:13px;font-weight:500;color:var(--txt);
+}
+.cell-meta{
+  font-family:var(--mono);font-size:10px;color:var(--txt3);margin-top:2px;
+}
+.url-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.url-anchor{
+  font-family:var(--mono);font-size:11px;color:var(--blue);
+  text-decoration:none;border:1px solid var(--blue-dim);
+  padding:3px 9px;border-radius:4px;white-space:nowrap;
+  transition:all .15s;
+}
+.url-anchor:hover{background:var(--blue-dim);border-color:var(--blue)}
+.url-text{
+  font-family:var(--mono);font-size:10px;color:var(--txt3);
+  margin-top:3px;word-break:break-all;max-width:320px;
+}
+.updated-cell{
+  font-family:var(--mono);font-size:11px;color:var(--txt3);
+  white-space:nowrap;
+}
+.rotate-btn{color:var(--warn);border-color:rgba(245,166,35,.25)}
+.rotate-btn:hover{border-color:var(--warn);background:rgba(245,166,35,.08)}
 
-    elif choice == "6":
-        subprocess.run(["systemctl","enable","nginx","--quiet"],check=False)
-        subprocess.run(["systemctl","start","nginx"])
-        print(green("  Nginx enabled and started."))
+/* Empty state */
+.empty{
+  text-align:center;padding:64px 20px;color:var(--txt3);
+}
+.empty-icon{font-size:32px;margin-bottom:12px;opacity:.5}
+.empty h3{font-size:15px;font-weight:500;color:var(--txt2);margin-bottom:6px}
+.empty p{font-size:13px}
 
-# ── Self update ────────────────────────────────────────────────────────────
-GITHUB_RAW   = "https://raw.githubusercontent.com/diginetizen/mewobey-sub/main"
-UPDATE_FILES = ["update.py","webui.py","requirements.txt"]
+/* ─── Services tab ───────────────────────────── */
+.services-wrap{padding:20px;max-width:900px}
 
-def check_for_updates():
-    try:
-        r=requests.get(f"{GITHUB_RAW}/version.txt",timeout=10)
-        remote=r.text.strip() if r.status_code==200 else None
-        if not remote:
-            r2=requests.get("https://api.github.com/repos/diginetizen/mewobey-sub/commits/main",timeout=10)
-            remote=r2.json()["sha"][:8] if r2.status_code==200 else None
-        if not remote: return {"available":False,"error":"Cannot reach GitHub"}
-        lf=BASE_DIR/"version.txt"
-        local=lf.read_text().strip() if lf.exists() else None
-        if not local: return {"available":True,"local":"unknown","remote":remote}
-        return {"available":remote!=local,"local":local,"remote":remote}
-    except Exception as e:
-        return {"available":False,"error":str(e)}
+.sync-hero{
+  background:var(--surf);border:1px solid var(--brd);border-radius:var(--r);
+  padding:20px 24px;margin-bottom:20px;
+}
+.sync-hero-header{
+  display:flex;align-items:flex-start;justify-content:space-between;
+  flex-wrap:wrap;gap:16px;margin-bottom:16px;
+}
+.sync-mode-label{
+  font-family:var(--mono);font-size:10px;text-transform:uppercase;
+  letter-spacing:.08em;color:var(--txt3);margin-bottom:6px;
+}
+.sync-mode-val{
+  font-family:var(--mono);font-size:15px;font-weight:500;
+  display:flex;align-items:center;gap:8px;
+}
+.sync-mode-sub{
+  font-size:12px;color:var(--txt3);margin-top:4px;font-family:var(--mono);
+}
+.interval-row{
+  display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+}
+.interval-label{font-size:12px;color:var(--txt3);font-family:var(--mono)}
+.interval-input{
+  width:88px;background:var(--bg);border:1px solid var(--brd);
+  color:var(--txt);font-family:var(--mono);font-size:12px;
+  padding:6px 10px;border-radius:var(--r-sm);outline:none;
+  transition:border-color .2s,box-shadow .2s;
+}
+.interval-input:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-glow)}
+input[type=number]::-webkit-inner-spin-button,
+input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+input[type=number]{-moz-appearance:textfield}
 
-def do_self_update():
-    changed=[]; errors=[]
-    for fname in UPDATE_FILES:
-        dest=BASE_DIR/fname
-        try:
-            r=requests.get(f"{GITHUB_RAW}/{fname}",timeout=30); r.raise_for_status()
-            nc=r.text
-            if dest.exists() and dest.read_text()==nc: continue
-            if dest.exists(): dest.rename(str(dest)+".bak")
-            dest.write_text(nc); changed.append(fname)
-        except Exception as e:
-            errors.append(f"{fname}: {e}")
-    try:
-        r=requests.get(f"{GITHUB_RAW}/version.txt",timeout=10)
-        if r.status_code==200: (BASE_DIR/"version.txt").write_text(r.text.strip())
-        else:
-            r2=requests.get("https://api.github.com/repos/diginetizen/mewobey-sub/commits/main",timeout=10)
-            if r2.status_code==200: (BASE_DIR/"version.txt").write_text(r2.json()["sha"][:8])
-    except: pass
-    if "requirements.txt" in changed:
-        pip=BASE_DIR/"venv"/"bin"/"pip"
-        if pip.exists():
-            subprocess.run([str(pip),"install","--quiet","-r",str(BASE_DIR/"requirements.txt")],check=False)
-    if errors: print(red(f"  Errors: {'; '.join(errors)}"))
-    return bool(changed), changed
+.sync-stats{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));
+  gap:1px;background:var(--brd);border-radius:var(--r-sm);overflow:hidden;
+}
+.sync-stat{background:var(--surf2);padding:10px 14px}
+.sync-stat-label{font-family:var(--mono);font-size:10px;color:var(--txt3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px}
+.sync-stat-val{font-family:var(--mono);font-size:12px;color:var(--txt)}
 
-def self_update_interactive():
-    print(f"\n  {bold('Checking for updates...')}")
-    info=check_for_updates()
-    if "error" in info and not info.get("available"):
-        print(yellow(f"\n  Could not check: {info['error']}")); return
-    if not info.get("available"):
-        print(green(f"\n  Already up to date ({info.get('local','?')})")); return
-    print(f"\n  {yellow('Update available!')}")
-    print(f"  Current : {dim(info.get('local','?'))}")
-    print(f"  Latest  : {cyan(info.get('remote','?'))}\n")
-    print(f"  {cyan(' 1')}  Install update now")
-    print(f"  {cyan(' 0')}  Cancel\n")
-    if input("  Choose: ").strip() != "1": print("  Cancelled."); return
-    print("  Downloading...")
-    ok, changed = do_self_update()
-    if not changed: print(green("\n  Nothing changed.")); return
-    print(green(f"\n  Updated: {', '.join(changed)}"))
-    if ok:
-        print(f"\n  {yellow('Restart needed.')}")
-        print(f"  {cyan(' 1')}  Restart now")
-        print(f"  {cyan(' 0')}  Skip\n")
-        if input("  Choose: ").strip() == "1":
-            subprocess.run(["systemctl","restart","xui-subsync","xui-webui"],check=False)
-            print(green("  Restarted."))
+.svc-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}
+.svc-card{
+  background:var(--surf);border:1px solid var(--brd);border-radius:var(--r);
+  padding:18px 20px;transition:border-color .15s;
+}
+.svc-card:hover{border-color:var(--brd2)}
+.svc-card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.svc-name{font-family:var(--mono);font-size:11px;color:var(--txt3);text-transform:uppercase;letter-spacing:.06em}
+.svc-dot{width:8px;height:8px;border-radius:50%;background:var(--txt3)}
+.svc-dot.running{background:var(--green);box-shadow:0 0 0 3px rgba(46,204,141,.2)}
+.svc-dot.failed{background:var(--err)}
+.svc-status{font-family:var(--mono);font-size:14px;font-weight:500;margin-bottom:4px}
+.svc-status.running{color:var(--green)}
+.svc-status.stopped{color:var(--txt3)}
+.svc-status.failed{color:var(--err)}
+.svc-detail{font-family:var(--mono);font-size:10px;color:var(--txt3);line-height:1.6}
+.svc-actions{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
 
-# ── Service status ──────────────────────────────────────────────────────────
-def svc_info(name):
-    r=subprocess.run(["systemctl","is-active",name],capture_output=True,text=True)
-    s=r.stdout.strip()
-    if s=="active":   return green("● active"),  True,  len("● active")
-    if s=="inactive": return dim("○ inactive"), False, len("○ inactive")
-    if s=="failed":   return red("✗ failed"),   False, len("✗ failed")
-    return dim(f"○ {s}"), False, len(f"○ {s}")
+/* ─── Settings tab ───────────────────────────── */
+.settings-wrap{
+  display:grid;grid-template-columns:200px 1fr;min-height:calc(100vh - 120px);
+}
+.settings-nav{
+  border-right:1px solid var(--brd);padding:20px 0;
+  background:var(--surf);position:sticky;top:56px;align-self:start;
+}
+.settings-nav-item{
+  display:block;width:100%;text-align:left;padding:9px 20px;border:none;
+  background:transparent;font-family:var(--sans);font-size:13px;font-weight:400;
+  color:var(--txt2);cursor:pointer;transition:all .15s;border-left:2px solid transparent;
+}
+.settings-nav-item:hover{background:var(--surf2);color:var(--txt)}
+.settings-nav-item.active{color:var(--acc);border-left-color:var(--acc);background:var(--acc-dim);font-weight:500}
+.settings-content{padding:24px;max-width:640px}
 
-# ── Menu box drawing ────────────────────────────────────────────────────────
-W = 46
+.settings-section{display:none}.settings-section.active{display:block}
+.settings-section h3{
+  font-size:15px;font-weight:600;color:var(--txt);margin-bottom:4px;
+}
+.settings-section .section-desc{
+  font-size:13px;color:var(--txt3);margin-bottom:20px;
+}
+.field-group{
+  background:var(--surf);border:1px solid var(--brd);border-radius:var(--r);
+  overflow:hidden;margin-bottom:16px;
+}
+.field-row{
+  display:grid;grid-template-columns:1fr 1fr 80px;gap:12px;align-items:start;
+  padding:14px 16px;border-bottom:1px solid var(--brd);
+}
+.field-row:last-child{border-bottom:none}
+.field-label{font-size:13px;font-weight:500;color:var(--txt);padding-top:2px}
+.field-note{font-size:11px;color:var(--txt3);margin-top:3px;line-height:1.4}
+.field-input{
+  background:var(--bg);border:1px solid var(--brd);
+  color:var(--txt);font-family:var(--mono);font-size:12px;
+  padding:7px 11px;border-radius:var(--r-sm);outline:none;width:100%;
+  transition:border-color .2s,box-shadow .2s;
+}
+.field-input:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-glow)}
+.field-save{
+  align-self:start;padding:7px 14px;font-size:12px;
+  background:transparent;border:1px solid var(--brd2);border-radius:var(--r-sm);
+  color:var(--txt2);font-family:var(--sans);font-weight:500;
+  cursor:pointer;transition:all .15s;white-space:nowrap;
+}
+.field-save:hover{border-color:var(--acc);color:var(--acc);background:var(--acc-dim)}
+.field-save.saved{border-color:var(--green);color:var(--green);background:rgba(46,204,141,.08)}
 
-def _box_line(content):
-    vis = _vlen(content)
-    pad = " " * max(0, W - vis)
-    return f"{B}║{RS}{content}{pad}{B}║{RS}"
+/* ─── Theme toggle ───────────────────────────── */
+.theme-toggle{
+  width:34px;height:34px;border-radius:var(--r-sm);border:1px solid var(--brd);
+  background:var(--surf2);color:var(--txt2);cursor:pointer;
+  display:flex;align-items:center;justify-content:center;font-size:15px;
+  transition:all .15s;flex-shrink:0;
+}
+.theme-toggle:hover{border-color:var(--acc);color:var(--acc);background:var(--acc-dim)}
 
-def _blank(): return f"{B}║{RS}{' '*W}{B}║{RS}"
-def _sep():   return f"{B}╠{'═'*W}╣{RS}"
-def _top():   return f"{B}╔{'═'*W}╗{RS}"
-def _bot():   return f"{B}╚{'═'*W}╝{RS}"
+/* ─── Toast ──────────────────────────────────── */
+.toast{
+  position:fixed;bottom:24px;right:24px;
+  background:var(--surf);border:1px solid var(--brd);
+  border-left:3px solid var(--acc);
+  padding:12px 18px;border-radius:var(--r);
+  font-family:var(--mono);font-size:12px;color:var(--txt);
+  box-shadow:var(--shadow-lg);
+  opacity:0;transform:translateY(10px) scale(.98);
+  transition:all .2s cubic-bezier(.16,1,.3,1);
+  pointer-events:none;z-index:9999;max-width:340px;
+}
+.toast.show{opacity:1;transform:translateY(0) scale(1)}
+.toast.err{border-left-color:var(--err)}
+.toast.ok{border-left-color:var(--green)}
 
-def _mrow(key, label):
-    k = key.rjust(2)
-    return _box_line(f"  {cyan(k)}  {label}")
+/* ─── Mobile ─────────────────────────────────── */
+@media(max-width:700px){
+  .topbar{padding:0 14px}
+  .topbar-center{display:none}
+  thead th,tbody td{padding:9px 12px}
+  .toolbar{padding:10px 12px}
+  .url-text{display:none}
+  .services-wrap{padding:14px}
+  .settings-wrap{grid-template-columns:1fr}
+  .settings-nav{border-right:none;border-bottom:1px solid var(--brd);
+    display:flex;overflow-x:auto;padding:0;position:static;}
+  .settings-nav-item{border-left:none;border-bottom:2px solid transparent;white-space:nowrap}
+  .settings-nav-item.active{border-left:none;border-bottom-color:var(--acc)}
+  .settings-content{padding:14px}
+  .field-row{grid-template-columns:1fr;gap:8px}
+  .sync-hero-header{flex-direction:column}
+  .svc-cards{grid-template-columns:1fr}
+  .mobile-tabs{
+    display:flex!important;overflow-x:auto;border-bottom:1px solid var(--brd);
+    background:var(--surf);padding:0;
+  }
+  .stat-strip{grid-template-columns:1fr 1fr}
+}
+@media(min-width:701px){.mobile-tabs{display:none!important}}
+</style>
+</head>
+<body>
+<div id="app">
 
-def _srow(prefix, colored_val, vlen_val):
-    vis = len(_strip(prefix)) + vlen_val + 2
-    pad = " " * max(0, W - vis)
-    return f"{B}║{RS}  {prefix}{colored_val}{pad}{B}║{RS}"
+<!-- ── Top bar ── -->
+<header class="topbar">
+  <a class="brand" href="/">
+    <div class="brand-icon">gs</div>
+    <div class="brand-name">git<em>/</em>sub</div>
+  </a>
 
-# ── Interactive menu ────────────────────────────────────────────────────────
-def interactive_menu():
-    while True:
-        sc, sa, sv = svc_info("xui-subsync")
-        uc, ua, uv = svc_info("xui-webui")
+  <!-- Desktop tabs -->
+  <nav class="topbar-center">
+    <button class="tab-btn active" onclick="switchTab('users',this)">Users</button>
+    <button class="tab-btn" onclick="switchTab('services',this)">Services</button>
+    <button class="tab-btn" onclick="switchTab('settings',this)">Settings</button>
+  </nav>
 
-        print()
-        print(_top())
-        print(_box_line(f"  {cyan('gitsub')} {dim('—')} XUI Subscription Sync"))
-        print(_sep())
-        print(_srow("Services:  sync   ", sc, sv))
-        print(_srow("           webui  ", uc, uv))
-        print(_sep())
-        print(_blank())
-        print(_mrow( "1", "Sync now"))
-        print(_mrow( "2", "Show all users & URLs"))
-        print(_mrow( "3", "Lookup user"))
-        print(_mrow( "4", "Rotate user URL"))
-        print(_mrow( "5", "File map"))
-        print(_mrow( "6", "Live logs"))
-        print(_mrow( "7", "Settings"))
-        print(_mrow( "8", "Nginx / domain setup"))
-        print(_mrow( "9", "Restart services"))
-        print(_mrow("10", "Service status detail"))
-        print(_mrow("11", "Check for updates"))
-        print(_mrow("12", "Uninstall"))
-        print(_mrow( "0", "Exit"))
-        print(_blank())
-        print(_bot())
-        print()
+  <div class="topbar-right">
+    <div class="sync-indicator">
+      <div class="pulse" id="pulse"></div>
+      <span id="sync-label" style="font-family:var(--mono);font-size:11px">idle</span>
+    </div>
+    <button class="btn primary" id="sync-btn" onclick="doSync()">
+      <span>⟳</span><span>Sync</span>
+    </button>
+    <button class="theme-toggle" onclick="toggleTheme()" title="Toggle theme">☾</button>
+    <a href="/logout"><button class="btn danger sm">logout</button></a>
+  </div>
+</header>
 
-        choice = input("  Choose: ").strip()
+<!-- Mobile tabs -->
+<nav class="mobile-tabs">
+  <button class="tab-btn active" onclick="switchTab('users',this)">Users</button>
+  <button class="tab-btn" onclick="switchTab('services',this)">Services</button>
+  <button class="tab-btn" onclick="switchTab('settings',this)">Settings</button>
+</nav>
 
-        if choice == "0":
-            break
+<!-- ════════════════════════════════════════════ -->
+<!-- USERS PANEL                                  -->
+<!-- ════════════════════════════════════════════ -->
+<div class="panel active" id="panel-users">
+  <div class="stat-strip" id="stat-strip">
+    <div class="stat-cell">
+      <div class="stat-label">Total users</div>
+      <div class="stat-val" id="stat-total">—</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-label">GitHub repo</div>
+      <div class="stat-val text" id="stat-repo">—</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-label">Last sync</div>
+      <div class="stat-val text" id="stat-sync">—</div>
+    </div>
+  </div>
 
-        elif choice == "1":
-            print()
-            try:
-                result = Engine().sync()
-                print(green(f"\n  Done — {len(result)} users synced."))
-            except Exception as e:
-                print(red(f"\n  Error: {e}"))
-            input("\n  ENTER to continue...")
+  <div class="toolbar">
+    <div class="search-wrap">
+      <span class="search-icon">⌕</span>
+      <input type="text" id="search" placeholder="Search by email or sub ID…" oninput="filterTable()">
+    </div>
+    <span class="count-badge" id="count-badge"></span>
+    <button class="btn sm" id="sort-btn" onclick="toggleSort()">↑↓ A–Z</button>
+    <button class="btn sm" onclick="copyAllURLs()">copy all URLs</button>
+  </div>
 
-        elif choice == "2":
-            submap = Store().load()
-            if not submap:
-                print(yellow("\n  No users yet — run a sync first."))
-            else:
-                print(f"\n  {bold('All Users')}  ({len(submap)} total)\n")
-                print(f"  {'Email':<34}  Raw URL")
-                print(f"  {'-'*34}  {'-'*55}")
-                for _,v in sorted(submap.items(), key=lambda x: x[1].get("email","")):
-                    print(f"  {v.get('email','?'):<34}  {dim(v.get('raw_url','—'))}")
-            input("\n  ENTER to continue...")
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Email</th>
+          <th>Sub ID / File</th>
+          <th>Subscription URL</th>
+          <th>Updated</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="tbl-body">
+        <tr><td colspan="5"><div class="empty">
+          <div class="empty-icon">⟳</div>
+          <h3>Loading users…</h3>
+        </div></td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
 
-        elif choice == "3":
-            q = input("\n  Email or sub ID: ").strip()
-            results = Engine().lookup(q) if q else []
-            if not results: print(yellow("  Not found."))
-            for sid,v in results:
-                print(f"\n  Email   : {v.get('email')}")
-                print(f"  Sub ID  : {sid}")
-                print(f"  File    : {v.get('filename')}")
-                print(f"  URL     : {cyan(v.get('raw_url','—'))}")
-                print(f"  Updated : {v.get('updated_ts','—')}")
-            input("\n  ENTER to continue...")
+<!-- ════════════════════════════════════════════ -->
+<!-- SERVICES PANEL                               -->
+<!-- ════════════════════════════════════════════ -->
+<div class="panel" id="panel-services">
+  <div class="services-wrap">
 
-        elif choice == "4":
-            q = input("\n  Email or sub ID to rotate: ").strip()
-            if q and input(f"  Rotate URL for '{q}'? [y/n]: ").strip().lower() == "y":
-                r = Engine().rotate(q)
-                if not r: print(yellow("  Not found."))
-                for _,v in r: print(green(f"\n  Rotated: {v.get('email')} → {v.get('raw_url')}"))
-            input("\n  ENTER to continue...")
+    <!-- Sync hero card -->
+    <div class="sync-hero">
+      <div class="sync-hero-header">
+        <div>
+          <div class="sync-mode-label">Sync daemon</div>
+          <div class="sync-mode-val" id="daemon-mode">—</div>
+          <div class="sync-mode-sub" id="daemon-next"></div>
+        </div>
+        <div class="interval-row">
+          <span class="interval-label">Interval</span>
+          <input class="interval-input" id="interval-val" type="number" min="60">
+          <span class="interval-label">sec</span>
+          <button class="btn sm" onclick="applyInterval()">Apply</button>
+          <button class="btn primary sm" onclick="doSync()">⟳ Sync now</button>
+        </div>
+      </div>
+      <div class="sync-stats">
+        <div class="sync-stat">
+          <div class="sync-stat-label">Last sync</div>
+          <div class="sync-stat-val" id="si-last">—</div>
+        </div>
+        <div class="sync-stat">
+          <div class="sync-stat-label">Next sync</div>
+          <div class="sync-stat-val" id="si-next">—</div>
+        </div>
+        <div class="sync-stat">
+          <div class="sync-stat-label">Interval</div>
+          <div class="sync-stat-val" id="si-interval">—</div>
+        </div>
+        <div class="sync-stat">
+          <div class="sync-stat-label">Right now</div>
+          <div class="sync-stat-val" id="si-now">Idle</div>
+        </div>
+      </div>
+    </div>
 
-        elif choice == "5":
-            submap = Store().load()
-            if not submap:
-                print(yellow("\n  No subs yet."))
-            else:
-                cfg  = Config()
-                sdir = cfg.subs_path
-                print(f"\n  {bold('File Map')}  ({len(submap)} files in {sdir})\n")
-                print(f"  {'Email':<28}  OK  {'File':<34}  Updated")
-                print(f"  {'-'*28}  --  {'-'*34}  {'-'*16}")
-                for _,v in sorted(submap.items(), key=lambda x: x[1].get("email","")):
-                    fp  = sdir / v.get("filename","")
-                    ok  = green("✓") if fp.exists() else red("✗")
-                    ts  = (v.get("updated_ts") or "—")[:16]
-                    print(f"  {v.get('email','?'):<28}  {ok}   {v.get('filename','?'):<34}  {dim(ts)}")
-                print(f"\n  {dim(cfg.raw_base_url)}")
-            input("\n  ENTER to continue...")
+    <!-- Service cards -->
+    <div class="svc-cards" id="svc-cards">
+      <div class="empty"><p>Loading services…</p></div>
+    </div>
+  </div>
+</div>
 
-        elif choice == "6":
-            print(f"\n  {dim('Ctrl+C to stop')}\n")
-            try: subprocess.run(["tail","-f",str(LOG_DIR/"sync.log")])
-            except KeyboardInterrupt: pass
+<!-- ════════════════════════════════════════════ -->
+<!-- SETTINGS PANEL                               -->
+<!-- ════════════════════════════════════════════ -->
+<div class="panel" id="panel-settings">
+  <div class="settings-wrap">
+    <nav class="settings-nav" id="settings-nav">
+      <button class="settings-nav-item active" onclick="switchSection('panel',this)">Panel</button>
+      <button class="settings-nav-item" onclick="switchSection('github',this)">GitHub</button>
+      <button class="settings-nav-item" onclick="switchSection('sync',this)">Sync</button>
+      <button class="settings-nav-item" onclick="switchSection('webui',this)">Web UI</button>
+      <button class="settings-nav-item" onclick="switchSection('subs',this)">Subscriptions</button>
+      <button class="settings-nav-item" onclick="switchSection('nginx',this)">Nginx</button>
+    </nav>
 
-        elif choice == "7":
-            print(f"\n  {cyan(' 1')}  View all settings")
-            print(f"  {cyan(' 2')}  Edit a setting")
-            print(f"  {cyan(' 0')}  Back")
-            sub = input("\n  Choose: ").strip()
-            if sub=="1": show_settings(); input("\n  ENTER to continue...")
-            elif sub=="2": edit_settings(); input("\n  ENTER to continue...")
+    <div class="settings-content" id="settings-content">
+      <!-- dynamically rendered -->
+    </div>
+  </div>
+</div>
 
-        elif choice == "8":
-            nginx_menu()
-            input("\n  ENTER to continue...")
+</div><!-- #app -->
+<div class="toast" id="toast"></div>
 
-        elif choice == "9":
-            print(f"\n  {cyan(' 1')}  Restart both services")
-            print(f"  {cyan(' 2')}  Restart sync daemon only")
-            print(f"  {cyan(' 3')}  Restart web UI only")
-            print(f"  {cyan(' 0')}  Back")
-            sub = input("\n  Choose: ").strip()
-            if sub=="1": subprocess.run(["systemctl","restart","xui-subsync","xui-webui"],check=False); print(green("  Restarted both."))
-            elif sub=="2": subprocess.run(["systemctl","restart","xui-subsync"],check=False); print(green("  Sync daemon restarted."))
-            elif sub=="3": subprocess.run(["systemctl","restart","xui-webui"],check=False); print(green("  Web UI restarted."))
-            input("\n  ENTER to continue...")
+<script>
+// ── State ────────────────────────────────────
+let rows=[], sortDir='asc', pollTimer=null;
 
-        elif choice == "10":
-            subprocess.run(["systemctl","status","xui-subsync","xui-webui","--no-pager"])
-            input("\n  ENTER to continue...")
+// ── Theme ────────────────────────────────────
+function initTheme(){
+  const saved = localStorage.getItem('gs-theme') || 'dark';
+  document.documentElement.dataset.theme = saved;
+  document.querySelector('.theme-toggle').textContent = saved==='dark' ? '☾' : '☀';
+}
+function toggleTheme(){
+  const cur = document.documentElement.dataset.theme;
+  const next = cur==='dark' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next;
+  localStorage.setItem('gs-theme', next);
+  document.querySelector('.theme-toggle').textContent = next==='dark' ? '☾' : '☀';
+}
+initTheme();
 
-        elif choice == "11":
-            self_update_interactive()
-            input("\n  ENTER to continue...")
+// ── Tabs ─────────────────────────────────────
+function switchTab(id, btn){
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+  document.getElementById('panel-'+id).classList.add('active');
+  document.querySelectorAll('.tab-btn').forEach(b=>{
+    if(b.textContent.trim().toLowerCase()===id) b.classList.add('active');
+  });
+  if(id==='services') loadServices();
+  if(id==='settings') initSettings();
+}
 
-        elif choice == "12":
-            print(f"\n  {red('Uninstall gitsub?')}")
-            print("  This will stop and remove all services, the CLI, and optionally project files.\n")
-            if input("  Are you sure? [y/n]: ").strip().lower() not in ("y","yes"):
-                print("  Cancelled."); input("\n  ENTER to continue..."); continue
+// ── Toast ────────────────────────────────────
+function toast(msg,type=''){
+  const el=document.getElementById('toast');
+  el.textContent=msg;
+  el.className='toast show'+(type?' '+type:'');
+  clearTimeout(el._t);
+  el._t=setTimeout(()=>el.className='toast',3200);
+}
 
-            # Ask about clearing GitHub repo
-            print()
-            print(f"  {yellow('Clear GitHub repo?')}")
-            print("  Remove all subscription files from your GitHub repo?")
-            print("  Your users will lose access to their subscription links.\n")
-            if input("  Remove subs from GitHub too? [y/n]: ").strip().lower() in ("y","yes"):
-                try:
-                    cfg = Config(); sdir = cfg.subs_dir
-                    import shutil
-                    subs_path = BASE_DIR / sdir
-                    if subs_path.exists():
-                        shutil.rmtree(subs_path); subs_path.mkdir()
-                        (subs_path/".gitkeep").touch()
-                    git = Git(cfg); git.ensure_remote()
-                    subprocess.run(["git","add","-A"], cwd=BASE_DIR, check=False)
-                    subprocess.run(["git","commit","-m","uninstall: remove all subs"], cwd=BASE_DIR, check=False)
-                    subprocess.run(["git","push",git._remote_url(),cfg.github_branch], cwd=BASE_DIR, check=False)
-                    print(green("  GitHub repo cleared."))
-                except Exception as e:
-                    print(red(f"  Could not clear GitHub: {e}"))
+function esc(s){
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
 
-            uninstall_path = BASE_DIR/"uninstall.sh"
-            if uninstall_path.exists():
-                subprocess.run(["bash",str(uninstall_path)])
-            else:
-                print(red("  uninstall.sh not found."))
-            print(green("\n  Uninstall complete."))
-            sys.exit(0)
+// ── Users ────────────────────────────────────
+async function loadUsers(){
+  const r = await fetch('/api/data');
+  if(r.status===401){location='/login';return;}
+  const d = await r.json();
+  rows = d.entries;
+  applySortAndRender();
+  document.getElementById('stat-total').textContent = d.total;
+  document.getElementById('stat-repo').textContent  = d.repo || '—';
+  document.getElementById('stat-sync').textContent  = d.last_sync || 'never';
+  document.getElementById('count-badge').textContent= `${d.total} users`;
+}
 
-        else:
-            print(yellow("  Unknown choice."))
+function applySortAndRender(){
+  rows.sort((a,b)=> sortDir==='asc'
+    ? (a.email||'').localeCompare(b.email||'')
+    : (b.email||'').localeCompare(a.email||''));
+  filterTable();
+}
 
-# ── Daemon ──────────────────────────────────────────────────────────────────
-def run_daemon(interval):
-    log.info(f"Daemon started — interval: {interval}s")
-    while True:
-        try: Engine().sync()
-        except Exception as e: log.error(f"Sync error: {e}")
-        log.info(f"Next sync in {interval}s")
-        time.sleep(interval)
+function filterTable(){
+  const q = document.getElementById('search').value.toLowerCase();
+  const filtered = q
+    ? rows.filter(r=>(r.email||'').toLowerCase().includes(q)||(r.sub_id||'').toLowerCase().includes(q))
+    : rows;
+  renderRows(filtered);
+  document.getElementById('count-badge').textContent =
+    q ? `${filtered.length} of ${rows.length}` : `${rows.length} users`;
+}
 
-# ── Main ────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    args = sys.argv[1:]
-    if not args:
-        interactive_menu()
-    elif args[0]=="update":
-        info=check_for_updates()
-        if info.get("error") and not info.get("available"):
-            print(yellow(f"Cannot check: {info['error']}")); sys.exit(1)
-        if not info.get("available"):
-            print(green(f"Up to date ({info.get('local','?')})")); sys.exit(0)
-        print(f"Update: {info.get('local')} → {info.get('remote')}")
-        ok,changed=do_self_update()
-        print(f"Updated: {', '.join(changed) or 'nothing'}")
-        if ok: subprocess.run(["systemctl","restart","xui-subsync","xui-webui"],check=False)
-    elif args[0]=="sync":
-        Engine().sync()
-    elif args[0]=="daemon":
-        interval=21600
-        if "--interval" in args: interval=int(args[args.index("--interval")+1])
-        run_daemon(interval)
-    elif args[0]=="lookup":
-        if len(args)<2: print("Usage: gitsub lookup <email|subId>"); sys.exit(1)
-        for sid,v in Engine().lookup(args[1]):
-            print(f"\n  Email  : {v.get('email')}\n  Sub ID : {sid}\n  URL    : {v.get('raw_url')}")
-    elif args[0]=="rotate":
-        if len(args)<2: print("Usage: gitsub rotate <email|subId>"); sys.exit(1)
-        for _,v in Engine().rotate(args[1]): print(f"  Rotated {v.get('email')} → {v.get('raw_url')}")
-    elif args[0]=="status":
-        sm=Store().load(); print(f"\n  Users: {len(sm)}")
-        for sid,v in sm.items(): print(f"  • {v.get('email','?'):<34} {v.get('raw_url','—')}")
-    elif args[0]=="settings":
-        edit_settings() if len(args)>1 and args[1]=="edit" else show_settings()
-    elif args[0]=="webui":
-        os.execv(sys.executable,[sys.executable,str(BASE_DIR/"webui.py")])
-    elif args[0] in ("help","--help","-h"):
-        print(f"\n{bold('gitsub')} commands:\n"
-              f"  {cyan('gitsub')}               interactive menu\n"
-              f"  {cyan('gitsub sync')}           sync now\n"
-              f"  {cyan('gitsub daemon')}         run daemon\n"
-              f"  {cyan('gitsub update')}         update scripts\n"
-              f"  {cyan('gitsub lookup')} <q>     find user\n"
-              f"  {cyan('gitsub rotate')} <q>     rotate URL\n"
-              f"  {cyan('gitsub status')}         list all users\n"
-              f"  {cyan('gitsub settings')}       view settings\n"
-              f"  {cyan('gitsub settings edit')}  change a setting\n"
-              f"  {cyan('gitsub webui')}          start web UI\n")
-    else:
-        print(f"Unknown: {args[0]}. Run 'gitsub help'."); sys.exit(1)
+function renderRows(data){
+  const tbody = document.getElementById('tbl-body');
+  if(!data.length){
+    tbody.innerHTML=`<tr><td colspan="5"><div class="empty">
+      <div class="empty-icon">◦</div>
+      <h3>No users found</h3>
+      <p>Run a sync to populate</p>
+    </div></td></tr>`;
+    return;
+  }
+  tbody.innerHTML = data.map(r=>`
+    <tr>
+      <td><div class="cell-email">${esc(r.email)}</div></td>
+      <td>
+        <div class="cell-meta" title="${esc(r.sub_id)}">${esc(r.sub_id.slice(0,14))}…</div>
+        <div class="cell-meta">${esc(r.filename)}</div>
+      </td>
+      <td>
+        <div class="url-actions">
+          <a class="url-anchor" href="${esc(r.raw_url)}" target="_blank">open ↗</a>
+          <button class="btn xs" onclick="cpURL('${esc(r.raw_url)}',this)">copy</button>
+        </div>
+        <div class="url-text">${esc(r.raw_url)}</div>
+      </td>
+      <td class="updated-cell">${esc(r.updated)}</td>
+      <td>
+        <button class="btn xs rotate-btn" onclick="rotateUser('${esc(r.sub_id)}','${esc(r.email)}')">rotate</button>
+      </td>
+    </tr>`).join('');
+}
+
+function toggleSort(){
+  sortDir = sortDir==='asc' ? 'desc' : 'asc';
+  document.getElementById('sort-btn').textContent = sortDir==='asc' ? '↑↓ A–Z' : '↑↓ Z–A';
+  applySortAndRender();
+}
+
+function cpURL(url,btn){
+  const done=()=>{
+    btn.textContent='✓'; btn.classList.add('ok-flash');
+    setTimeout(()=>{btn.textContent='copy';btn.classList.remove('ok-flash')},1600);
+  };
+  if(navigator.clipboard&&window.isSecureContext)
+    navigator.clipboard.writeText(url).then(done);
+  else{
+    const t=document.createElement('textarea');t.value=url;
+    t.style.cssText='position:fixed;opacity:0';
+    document.body.appendChild(t);t.focus();t.select();
+    document.execCommand('copy');document.body.removeChild(t);done();
+  }
+}
+
+function copyAllURLs(){
+  const urls=rows.map(r=>r.raw_url).join('\n');
+  if(navigator.clipboard&&window.isSecureContext)
+    navigator.clipboard.writeText(urls).then(()=>toast('Copied all URLs','ok'));
+  else{
+    const t=document.createElement('textarea');t.value=urls;
+    t.style.cssText='position:fixed;opacity:0';
+    document.body.appendChild(t);t.focus();t.select();
+    document.execCommand('copy');document.body.removeChild(t);
+    toast('Copied all URLs','ok');
+  }
+}
+
+async function rotateUser(sub_id,email){
+  if(!confirm(`Rotate URL for ${email}?\n\nThey will need the new link to reconnect.`)) return;
+  const r=await fetch('/api/rotate',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({sub_id})});
+  const d=await r.json();
+  if(d.ok){toast(`Rotated: ${email}`,'ok');loadUsers();}
+  else toast(d.msg||'Rotate failed','err');
+}
+
+// ── Sync ─────────────────────────────────────
+async function doSync(){
+  const btn=document.getElementById('sync-btn');
+  btn.disabled=true;
+  const r=await fetch('/api/sync',{method:'POST'});
+  if(r.status===401){location='/login';return;}
+  const d=await r.json();
+  if(d.ok){
+    toast('Sync started…');
+    setSyncPulse('syncing');
+    pollForSyncEnd();
+  } else {
+    toast(d.msg||'Already running','err');
+    btn.disabled=false;
+  }
+}
+
+function setSyncPulse(state){
+  const p=document.getElementById('pulse');
+  const l=document.getElementById('sync-label');
+  if(state==='syncing'){p.className='pulse active';l.textContent='syncing';}
+  else if(state==='ok'){p.className='pulse ok';l.textContent='idle';setTimeout(()=>{p.className='pulse';},3000);}
+  else{p.className='pulse';l.textContent='idle';}
+}
+
+function pollForSyncEnd(){
+  clearInterval(pollTimer);
+  pollTimer=setInterval(async()=>{
+    const r=await fetch('/api/sync/status');
+    const d=await r.json();
+    if(!d.running){
+      clearInterval(pollTimer);
+      document.getElementById('sync-btn').disabled=false;
+      setSyncPulse('ok');
+      loadUsers();
+      toast('Sync complete ✓','ok');
+      // Refresh service info if tab visible
+      if(document.getElementById('panel-services').classList.contains('active'))
+        loadSyncInfo();
+    }
+  },2000);
+}
+
+// ── Services ─────────────────────────────────
+async function loadSyncInfo(){
+  const r=await fetch('/api/sync/info');
+  if(r.status===401){location='/login';return;}
+  const d=await r.json();
+
+  const modeEl=document.getElementById('daemon-mode');
+  modeEl.innerHTML = d.daemon_active
+    ? `<span style="color:var(--green)">● auto</span> <span style="color:var(--txt3);font-size:12px">daemon running</span>`
+    : `<span style="color:var(--warn)">○ manual</span> <span style="color:var(--txt3);font-size:12px">daemon not running</span>`;
+
+  document.getElementById('daemon-next').textContent = d.daemon_active
+    ? (d.syncing_now ? '⟳ syncing right now…' : `next sync in ${d.countdown}`)
+    : 'start xui-subsync to enable automatic syncing';
+
+  document.getElementById('si-last').textContent     = d.last_sync||'never';
+  document.getElementById('si-next').textContent     = d.daemon_active ? d.next_sync : '—';
+  document.getElementById('si-interval').textContent = `${d.interval_fmt} (${d.interval}s)`;
+  document.getElementById('si-now').textContent      = d.syncing_now ? '⟳ Syncing…' : 'Idle';
+
+  const inp=document.getElementById('interval-val');
+  if(inp&&!inp.dataset.touched) inp.value=d.interval;
+}
+
+async function applyInterval(){
+  const val=parseInt(document.getElementById('interval-val').value);
+  if(!val||val<60){toast('Minimum is 60 seconds','err');return;}
+  const r=await fetch('/api/settings',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({key:'sync_interval',value:String(val)})});
+  const d=await r.json();
+  if(d.ok){
+    toast('Interval saved — restarting sync daemon…','ok');
+    await fetch('/api/service',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'restart',name:'xui-subsync'})});
+    setTimeout(loadSyncInfo,1800);
+  } else toast(d.msg||'Save failed','err');
+}
+
+async function loadServices(){
+  await loadSyncInfo();
+  const r=await fetch('/api/services');
+  if(r.status===401){location='/login';return;}
+  const d=await r.json();
+  const wrap=document.getElementById('svc-cards');
+  wrap.innerHTML=d.services.map(s=>{
+    const st=s.active?'running':(s.state==='failed'?'failed':'stopped');
+    return `
+    <div class="svc-card">
+      <div class="svc-card-header">
+        <span class="svc-name">${esc(s.name)}</span>
+        <span class="svc-dot ${s.active?'running':(s.state==='failed'?'failed':'')}"></span>
+      </div>
+      <div class="svc-status ${st}">${s.active?'● running':(s.state==='failed'?'✗ failed':'○ stopped')}</div>
+      <div class="svc-detail">
+        ${s.active?`Since ${esc(s.since)}<br>`:''}
+        PID ${esc(s.pid)} · Memory ${esc(s.memory)}
+      </div>
+      <div class="svc-actions">
+        <button class="btn sm" onclick="svcAct('restart','${esc(s.name)}')">restart</button>
+        <button class="btn sm ${s.active?'danger':''}" onclick="svcAct('${s.active?'stop':'start'}','${esc(s.name)}')">${s.active?'stop':'start'}</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function svcAct(action,name){
+  const r=await fetch('/api/service',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({action,name})});
+  const d=await r.json();
+  if(d.ok){toast(`${name}: ${action}`,'ok');setTimeout(loadServices,1200);}
+  else toast(d.msg||'Failed','err');
+}
+
+// ── Settings ─────────────────────────────────
+const SECTIONS = {
+  panel:{
+    title:'Panel Connection',
+    desc:'Your 3x-ui panel API credentials.',
+    fields:[
+      {k:'panel_api_url',label:'Panel base URL',type:'text',
+       note:'Full URL with port and optional path. e.g. https://panel.example.com:2053/path'},
+      {k:'api_token',label:'API bearer token',type:'password',
+       note:'Panel → Settings → Authentication → API token'},
+    ]
+  },
+  github:{
+    title:'GitHub Repository',
+    desc:'Where subscription files are pushed.',
+    fields:[
+      {k:'github_user',label:'Username',type:'text',note:'Your GitHub account name'},
+      {k:'github_repo',label:'Repository',type:'text',note:'Must be a public repository'},
+      {k:'github_branch',label:'Branch',type:'text',note:'Default: main'},
+      {k:'deploy_method',label:'Deploy method',type:'text',note:'token — GitHub PAT   /   ssh — deploy key'},
+      {k:'github_token',label:'Personal access token',type:'password',note:'Scope: repo (full)'},
+      {k:'ssh_key_path',label:'SSH key path',type:'text',note:'Path to private key on this server'},
+    ]
+  },
+  sync:{
+    title:'Sync Schedule',
+    desc:'How often gitsub fetches from the panel.',
+    fields:[
+      {k:'sync_interval',label:'Sync interval (seconds)',type:'number',
+       note:'Change live in the Services tab too. Restart sync daemon to apply.'},
+    ]
+  },
+  webui:{
+    title:'Web UI',
+    desc:'Dashboard access credentials and port.',
+    fields:[
+      {k:'ui_port',label:'Port',type:'number',note:'Service restart required'},
+      {k:'ui_user',label:'Username',type:'text'},
+      {k:'ui_pass',label:'Password',type:'password'},
+    ]
+  },
+  subs:{
+    title:'Subscriptions',
+    desc:'Control how subscription files are named and stored.',
+    fields:[
+      {k:'subs_dir',label:'Folder name in repo',type:'text',
+       note:'The GitHub folder holding all .txt files (default: subs)'},
+      {k:'filename_mode',label:'Filename mode',type:'text',
+       note:'random — secure random string (recommended)   |   email — user\'s email'},
+      {k:'filename_length',label:'Random filename length',type:'number',
+       note:'Characters in the random part (default: 32)'},
+    ]
+  },
+  nginx:{
+    title:'Nginx & Domain',
+    desc:'Configure nginx to serve the dashboard via a custom domain.',
+    fields:[
+      {k:'access_mode',label:'Access mode',type:'text',
+       note:'1 = IP address only   |   2 = domain via nginx proxy'},
+      {k:'domain',label:'Domain name',type:'text',
+       note:'e.g. sub.example.com — must point to this server via DNS A record'},
+    ]
+  },
+};
+
+let cfgCache={}, activeSection='panel';
+
+async function initSettings(){
+  const r=await fetch('/api/settings');
+  if(r.status===401){location='/login';return;}
+  const d=await r.json();
+  cfgCache=d.cfg;
+  renderSection(activeSection);
+}
+
+function switchSection(id,btn){
+  activeSection=id;
+  document.querySelectorAll('.settings-nav-item').forEach(b=>b.classList.remove('active'));
+  if(btn) btn.classList.add('active');
+  renderSection(id);
+}
+
+function renderSection(id){
+  const sec=SECTIONS[id];
+  if(!sec) return;
+  const content=document.getElementById('settings-content');
+  content.innerHTML=`
+    <h3>${sec.title}</h3>
+    <p class="section-desc">${sec.desc}</p>
+    <div class="field-group">
+      ${sec.fields.map(f=>`
+        <div class="field-row">
+          <div>
+            <div class="field-label">${f.label}</div>
+            ${f.note?`<div class="field-note">${f.note}</div>`:''}
+          </div>
+          <input class="field-input" id="fi_${f.k}"
+            type="${f.type||'text'}"
+            value="${f.type==='password'?'':esc(cfgCache[f.k]||'')}"
+            placeholder="${f.type==='password'?'(unchanged)':''}">
+          <button class="field-save" id="fs_${f.k}"
+            onclick="saveSetting('${f.k}','${f.type}')">Save</button>
+        </div>`).join('')}
+    </div>`;
+}
+
+async function saveSetting(key,type){
+  const inp=document.getElementById('fi_'+key);
+  const btn=document.getElementById('fs_'+key);
+  let val=inp.value.trim();
+  if(type==='password'&&!val){toast('No change — field is empty');return;}
+  const r=await fetch('/api/settings',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({key,value:val})});
+  const d=await r.json();
+  if(d.ok){
+    toast(`Saved: ${key}`,'ok');
+    btn.textContent='Saved ✓';btn.classList.add('saved');
+    setTimeout(()=>{btn.textContent='Save';btn.classList.remove('saved')},2000);
+    if(type!=='password') cfgCache[key]=val;
+  } else toast(d.msg||'Save failed','err');
+}
+
+// ── Init ─────────────────────────────────────
+document.getElementById('interval-val').addEventListener('input',()=>{
+  document.getElementById('interval-val').dataset.touched='1';
+});
+loadUsers();
+</script>
+</body>
+</html>"""
+
+
+# ── Routes ──────────────────────────────────────────────────────────────────
+@app.route("/login", methods=["GET"])
+def login_page(): return LOGIN_HTML.replace("{error}","")
+
+@app.route("/login", methods=["POST"])
+def login_post():
+    u=request.form.get("username",""); p=request.form.get("password","")
+    if check_auth(u,p): session["ok"]=True; return redirect("/")
+    return LOGIN_HTML.replace("{error}",'<div class="err">Invalid credentials.</div>')
+
+@app.route("/logout")
+def logout(): session.clear(); return redirect("/login")
+
+@app.route("/")
+@login_required
+def index(): return DASH_HTML
+
+@app.route("/api/data")
+@login_required
+def api_data():
+    sm=load_submap(); cfg=load_cfg()
+    entries=[]; last=0
+    for sid,v in sm.items():
+        entries.append({"sub_id":sid,"email":v.get("email","—"),
+                        "filename":v.get("filename",""),"raw_url":v.get("raw_url",""),
+                        "updated":fmtts(v.get("updated"))})
+        if v.get("updated",0)>last: last=v["updated"]
+    entries.sort(key=lambda x:x["email"])
+    return jsonify({"total":len(entries),"entries":entries,
+                    "repo":f"{cfg.get('github_user','')}/{cfg.get('github_repo','')}",
+                    "last_sync":fmtts(last) if last else "never"})
+
+@app.route("/api/sync", methods=["POST"])
+@login_required
+def api_sync():
+    if trigger_sync(): return jsonify({"ok":True})
+    return jsonify({"ok":False,"msg":"Already running"}), 409
+
+@app.route("/api/sync/status")
+@login_required
+def api_sync_status(): return jsonify({"running":_syncing})
+
+@app.route("/api/sync/info")
+@login_required
+def api_sync_info(): return jsonify(sync_info())
+
+@app.route("/api/rotate", methods=["POST"])
+@login_required
+def api_rotate():
+    data=request.get_json(silent=True) or {}; sid=data.get("sub_id","").strip()
+    if not sid: return jsonify({"ok":False,"msg":"sub_id required"}),400
+    sm=load_submap()
+    if sid not in sm: return jsonify({"ok":False,"msg":"Not found"}),404
+    email=sm[sid].get("email",sid)
+    r=subprocess.run([sys.executable,str(BASE_DIR/"update.py"),"rotate",email],
+                     cwd=BASE_DIR,capture_output=True,text=True)
+    return jsonify({"ok":r.returncode==0,"msg":r.stderr or None})
+
+@app.route("/api/services")
+@login_required
+def api_services():
+    return jsonify({"services":[svc_status(s) for s in ["xui-subsync","xui-webui"]]})
+
+@app.route("/api/service", methods=["POST"])
+@login_required
+def api_service():
+    data=request.get_json(silent=True) or {}
+    action=data.get("action",""); name=data.get("name","")
+    if action not in {"start","stop","restart"} or name not in {"xui-subsync","xui-webui"}:
+        return jsonify({"ok":False,"msg":"Not allowed"}),400
+    r=subprocess.run(["systemctl",action,name],capture_output=True,text=True)
+    return jsonify({"ok":r.returncode==0,"msg":r.stderr.strip() or None})
+
+EDITABLE={"panel_api_url","api_token","github_user","github_repo","github_branch",
+          "deploy_method","github_token","ssh_key_path","sync_interval","ui_port",
+          "ui_user","ui_pass","filename_length","filename_mode","domain","access_mode","subs_dir"}
+NUMERIC ={"sync_interval","ui_port","filename_length"}
+
+@app.route("/api/settings")
+@login_required
+def api_settings():
+    cfg=load_cfg(); safe=dict(cfg)
+    for k in ("api_token","github_token","ui_pass","flask_secret"):
+        if safe.get(k): safe[k]=""
+    return jsonify({"cfg":safe})
+
+@app.route("/api/settings", methods=["POST"])
+@login_required
+def api_settings_save():
+    data=request.get_json(silent=True) or {}
+    key=data.get("key",""); val=data.get("value","")
+    if key not in EDITABLE: return jsonify({"ok":False,"msg":"Not editable"}),400
+    cfg=load_cfg()
+    if key in NUMERIC:
+        try: val=int(val)
+        except: return jsonify({"ok":False,"msg":"Must be a number"}),400
+    cfg[key]=val; save_cfg(cfg)
+    return jsonify({"ok":True})
+
+if __name__=="__main__":
+    print(f"  gitsub WebUI → http://0.0.0.0:{PORT}")
+    app.run(host="0.0.0.0", port=PORT, debug=False)
