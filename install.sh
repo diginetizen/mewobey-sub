@@ -30,13 +30,15 @@ SERVICE_SYNC="xui-subsync"
 SERVICE_UI="xui-webui"
 NGINX_CONF="/etc/nginx/sites-available/xui-webui"
 
-G="\033[0;32m"; Y="\033[1;33m"; C="\033[0;36m"; R="\033[0;31m"; B="\033[1m"; RS="\033[0m"
+G="\033[0;32m"; Y="\033[1;33m"; C="\033[0;36m"; R="\033[0;31m"
+B="\033[1m"; D="\033[2m"; P="\033[0;35m"; RS="\033[0m"
 info()    { echo -e "${C}[info]${RS} $*"; }
 ok()      { echo -e "${G}[ ok]${RS} $*"; }
 warn()    { echo -e "${Y}[warn]${RS} $*"; }
 err()     { echo -e "${R}[ err]${RS} $*"; exit 1; }
 section() { echo ""; echo -e "${Y}── $* $(printf '─%.0s' $(seq 1 $((42-${#1}))))${RS}"; echo ""; }
-hint()    { echo -e "  ${B}→${RS} $*"; }
+hint()    { echo -e "  ${P}→${RS} $*"; }       # purple hints
+example() { echo -e "  ${D}e.g. $*${RS}"; }    # dim examples
 
 clear
 echo ""
@@ -175,8 +177,9 @@ SSHEOF
     echo ""
 else
     section "GitHub Token"
-    hint "Create a token at: https://github.com/settings/tokens"
-    hint "Required scope: repo  (full repository access)"
+    hint "Create one at: https://github.com/settings/tokens"
+    hint "Select scope: repo  (gives full repository access)"
+    example "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     GITHUB_TOKEN=$(masked_input "  Personal Access Token: ")
     echo ""; echo ""
 fi
@@ -221,25 +224,31 @@ if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
     echo ""; echo ""
 
     section "Access Mode"
-    hint "Choose how users will reach the dashboard."
-    hint "All modes serve the dashboard on port ${UI_PORT} only."
+    hint "How do you want to reach the dashboard?"
     echo ""
     echo "  [1] IP address only"
-    echo "      → http://YOUR_IP:${UI_PORT}"
+    example "http://YOUR_IP:${UI_PORT}"
     echo ""
-    echo "  [2] IP address  +  custom domain  (HTTP)"
-    echo "      → http://YOUR_IP:${UI_PORT}"
-    echo "      → http://your.domain:${UI_PORT}"
+    echo "  [2] Domain name via nginx  (HTTP proxy)"
+    example "http://YOUR_IP:${UI_PORT}  and  http://your.domain:${UI_PORT}"
     echo ""
     read -rp "  Choose [1/2] (default 1): " ACCESS_MODE
     ACCESS_MODE="${ACCESS_MODE:-1}"; echo ""
 
+    NGINX_HTTP_PORT="80"
     if [[ "$ACCESS_MODE" =~ ^[2]$ ]]; then
         section "Domain Name"
-        hint "The domain must already point to this server's IP via DNS."
-        hint "Example: sub.example.com  (A record → your server IP)"
+        hint "The domain must point to this server's IP in DNS (A record)."
+        example "sub.example.com  →  your server IP"
         read -rp "  Domain name: " DOMAIN
-        [ -z "$DOMAIN" ] && err "Domain name required for this access mode"
+        [ -z "$DOMAIN" ] && err "Domain name required for this mode"
+        echo ""
+
+        section "Nginx HTTP Port"
+        hint "Port nginx will listen on for the domain  (default: 80)."
+        hint "Change this only if port 80 is already used by something else."
+        read -rp "  Nginx HTTP port [80]: " NGINX_HTTP_PORT
+        NGINX_HTTP_PORT="${NGINX_HTTP_PORT:-80}"
         echo ""
     fi
 
@@ -280,7 +289,7 @@ if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
     echo "   Dashboard port : $UI_PORT"
     case "$ACCESS_MODE" in
         1) echo "   Access         : IP only (HTTP)" ;;
-        2) echo "   Access         : IP + domain $DOMAIN (HTTP via nginx)" ;;
+        2) echo "   Access         : IP + domain $DOMAIN (HTTP via nginx on port $NGINX_HTTP_PORT)" ;;
     esac
 fi
 echo ""
@@ -292,10 +301,25 @@ echo ""
 # ════════════════════════════════════════
 info "Installing system packages..."
 apt-get update -qq
-PKGS="python3 python3-venv python3-pip git"
-[[ "$ACCESS_MODE" =~ ^[23]$ ]] && PKGS="$PKGS nginx"
 
-apt-get install -y $PKGS -qq
+PKGS="python3 python3-venv python3-pip git"
+[ "$ACCESS_MODE" = "2" ] && PKGS="$PKGS nginx"
+
+# If nginx will be installed, purge any 443/SSL configs BEFORE apt runs.
+# apt-get post-install runs "systemctl start nginx" immediately — if any
+# existing config has "listen 443" and that port is taken, the whole install fails.
+if [ "$ACCESS_MODE" = "2" ]; then
+    info "Pre-cleaning nginx configs to prevent port 443 conflict..."
+    for conf in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
+        [ -f "$conf" ] && grep -q "listen.*443" "$conf" 2>/dev/null && \
+            rm -f "$conf" && info "  Removed old 443 config: $conf"
+    done
+    rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
+fi
+
+# DEBIAN_FRONTEND=noninteractive prevents dpkg from auto-starting nginx
+# during install, which would fail if configs are still being set up
+DEBIAN_FRONTEND=noninteractive apt-get install -y $PKGS -qq
 ok "Packages installed"
 
 info "Setting up $INSTALL_DIR..."
@@ -379,6 +403,7 @@ cat > "$INSTALL_DIR/config.json" <<EOF
   "ui_port":        $UI_PORT,
   "domain":         "$DOMAIN",
   "access_mode":    "$ACCESS_MODE",
+  "nginx_http_port": "$NGINX_HTTP_PORT",
 
   "subs_dir":        "$SUBS_DIR_NAME",
   "filename_length": 32,
@@ -473,7 +498,7 @@ write_nginx_conf() {
     # Write clean HTTP-only config — no SSL, no 443, just port 80 proxy
     cat > "$NGINX_CONF" <<NGINXEOF
 server {
-    listen 80;
+    listen ${NGINX_HTTP_PORT:-80};
     server_name ${domain};
     location / {
         proxy_pass           http://127.0.0.1:${UI_PORT};
@@ -503,7 +528,7 @@ NGINXEOF
     else
         systemctl start nginx
     fi
-    ok "Nginx: $domain → port $UI_PORT (HTTP)"
+    ok "Nginx: http://$domain:${NGINX_HTTP_PORT:-80} → port $UI_PORT"
 }
 
 if [ "$ACCESS_MODE" = "2" ] && [ -n "$DOMAIN" ]; then
@@ -528,7 +553,11 @@ if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
     echo "    http://$SERVER_IP:$UI_PORT"
     # Domain HTTP — modes 2 and 3
     if [ "$ACCESS_MODE" = "2" ] && [ -n "$DOMAIN" ]; then
-        echo "    http://$DOMAIN:$UI_PORT"
+        if [ "${NGINX_HTTP_PORT:-80}" = "80" ]; then
+            echo "    http://$DOMAIN"
+        else
+            echo "    http://$DOMAIN:$NGINX_HTTP_PORT"
+        fi
     fi
 
     echo ""
