@@ -407,12 +407,13 @@ def _offer_restart(changed_key=""):
 
 # ── Nginx config menu ───────────────────────────────────────────────────────
 def nginx_menu():
-    cfg  = load_config()
-    port = cfg.get("ui_port", 2086)
+    cfg       = load_config()
+    port      = cfg.get("ui_port", 2086)
+    http_port = cfg.get("nginx_http_port", 80)
     NGINX_CONF = "/etc/nginx/sites-available/xui-webui"
 
     print(f"\n{bold('Nginx / Domain Setup')}\n")
-    print(f"  Current: mode {cfg.get('access_mode','1')}  domain: {cfg.get('domain','none')}\n")
+    print(f"  Current: mode {cfg.get('access_mode','1')}  domain: {cfg.get('domain','none')}  nginx port: {http_port}\n")
     print(f"  {cyan(' 1')}  IP only — disable nginx for gitsub")
     print(f"  {cyan(' 2')}  Set up domain → port {port}  (nginx HTTP proxy)")
     print(f"  {cyan(' 3')}  Show current nginx config")
@@ -434,6 +435,9 @@ def nginx_menu():
     elif choice == "2":
         domain = input("  Domain name (e.g. sub.example.com): ").strip()
         if not domain: print(red("  Domain required.")); return
+        http_port_in = input(f"  Nginx HTTP port [{http_port}]: ").strip()
+        if http_port_in.isdigit(): http_port = int(http_port_in)
+        cfg["nginx_http_port"] = http_port
 
         if subprocess.run(["which","nginx"],capture_output=True).returncode != 0:
             print("  Installing nginx...")
@@ -447,7 +451,7 @@ def nginx_menu():
             if f and "xui-webui" not in f: subprocess.run(["rm","-f",f])
 
         conf = f"""server {{
-    listen 80;
+    listen {http_port};
     server_name {domain};
     location / {{
         proxy_pass           http://127.0.0.1:{port};
