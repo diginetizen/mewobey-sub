@@ -138,64 +138,197 @@ class Store:
 
 # ── Git ────────────────────────────────────────────────────────────────────
 class Git:
-    def __init__(self, cfg): self.cfg = cfg
+    def __init__(self, cfg):
+        self.cfg = cfg
 
     def _run(self, args, check=True):
-        r = subprocess.run(args, cwd=BASE_DIR, capture_output=True, text=True)
+        r = subprocess.run(
+            args,
+            cwd=BASE_DIR,
+            capture_output=True,
+            text=True
+        )
+
         if check and r.returncode != 0:
-            raise RuntimeError(f"git {args[1]}: {(r.stderr or r.stdout).strip()}")
+            raise RuntimeError(
+                f"git {args[1]}: {(r.stderr or r.stdout).strip()}"
+            )
+
         return r
+
+    def _ensure_gitignore(self):
+        gi = BASE_DIR / ".gitignore"
+
+        wanted = f"""*
+!{self.cfg.subs_dir}/
+!{self.cfg.subs_dir}/**
+!.gitignore
+"""
+
+        current = ""
+
+        if gi.exists():
+            try:
+                current = gi.read_text()
+            except Exception:
+                pass
+
+        if current != wanted:
+            gi.write_text(wanted)
+            log.info(".gitignore updated")
 
     def _remote_url(self):
         if self.cfg.deploy_method == "ssh":
-            return f"git@github-gitsub:{self.cfg.github_user}/{self.cfg.github_repo}.git"
+            return (
+                f"git@github-gitsub:"
+                f"{self.cfg.github_user}/"
+                f"{self.cfg.github_repo}.git"
+            )
+
         token = self.cfg.github_token
         user  = self.cfg.github_user
         repo  = self.cfg.github_repo
+
         if not token:
-            raise RuntimeError("GitHub token is empty. Set it in settings.")
+            raise RuntimeError(
+                "GitHub token is empty. Set it in settings."
+            )
+
         if not user or not repo:
-            raise RuntimeError("GitHub username or repo name is empty. Check settings.")
-        return f"https://{token}@github.com/{user}/{repo}.git"
+            raise RuntimeError(
+                "GitHub username or repo name is empty."
+            )
+
+        return (
+            f"https://{token}@github.com/"
+            f"{user}/{repo}.git"
+        )
 
     def ensure_remote(self):
-        """Always re-set remote URL in case user/repo/token changed."""
         url = self._remote_url()
-        r = self._run(["git","remote","get-url","origin"], check=False)
+
+        r = self._run(
+            ["git", "remote", "get-url", "origin"],
+            check=False
+        )
+
         if r.returncode != 0:
-            self._run(["git","remote","add","origin",url])
+            self._run(
+                ["git", "remote", "add", "origin", url]
+            )
         else:
-            self._run(["git","remote","set-url","origin",url])
+            self._run(
+                ["git", "remote", "set-url", "origin", url]
+            )
 
     def pull_rebase(self):
         try:
-            self._run(["git","fetch","origin",self.cfg.github_branch])
-            r = self._run(["git","rebase",f"origin/{self.cfg.github_branch}"], check=False)
+            self._run([
+                "git",
+                "fetch",
+                "origin",
+                self.cfg.github_branch
+            ])
+
+            r = self._run(
+                [
+                    "git",
+                    "rebase",
+                    f"origin/{self.cfg.github_branch}"
+                ],
+                check=False
+            )
+
             if r.returncode != 0:
-                self._run(["git","rebase","--abort"], check=False)
-                # Hard reset to remote — safe for subs-only repo
-                self._run(["git","reset","--hard",f"origin/{self.cfg.github_branch}"])
-                log.warning("Rebase conflict: reset to remote HEAD")
+                self._run(
+                    ["git", "rebase", "--abort"],
+                    check=False
+                )
+
+                self._run([
+                    "git",
+                    "reset",
+                    "--hard",
+                    f"origin/{self.cfg.github_branch}"
+                ])
+
+                log.warning(
+                    "Rebase conflict: reset to remote HEAD"
+                )
+
         except Exception as e:
             log.warning(f"pull_rebase skipped: {e}")
 
     def push(self) -> bool:
+        self._ensure_gitignore()
         self.ensure_remote()
+
         subs_dir = self.cfg.subs_dir
-        self._run(["git","add",f"{subs_dir}/"])
-        if not self._run(["git","status","--porcelain"],check=False).stdout.strip():
-            log.info("Nothing to push"); return False
+
+        # Stage ONLY the subscription folder
+        self._run([
+            "git",
+            "add",
+            "-A",
+            "--",
+            subs_dir
+        ])
+
+        # Check if anything inside subs_dir changed
+        staged = self._run(
+            [
+                "git",
+                "diff",
+                "--cached",
+                "--name-only",
+                "--",
+                subs_dir
+            ],
+            check=False
+        ).stdout.strip()
+
+        if not staged:
+            log.info("Nothing to push")
+            return False
+
         self.pull_rebase()
-        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-        self._run(["git","commit","-m",f"sync {ts}"])
-        result = subprocess.run(
-            ["git","push",self._remote_url(),self.cfg.github_branch],
-            cwd=BASE_DIR, capture_output=True, text=True
+
+        ts = datetime.utcnow().strftime(
+            "%Y-%m-%d %H:%M UTC"
         )
+
+        self._run([
+            "git",
+            "commit",
+            "-m",
+            f"sync {ts}"
+        ])
+
+        result = subprocess.run(
+            [
+                "git",
+                "push",
+                self._remote_url(),
+                self.cfg.github_branch
+            ],
+            cwd=BASE_DIR,
+            capture_output=True,
+            text=True
+        )
+
         if result.returncode != 0:
-            err = (result.stderr or result.stdout).strip()
-            raise RuntimeError(f"Push failed: {err or 'no error message — check token/repo name'}")
-        log.info("Git push OK"); return True
+            err = (
+                result.stderr
+                or result.stdout
+                or "unknown error"
+            ).strip()
+
+            raise RuntimeError(
+                f"Push failed: {err}"
+            )
+
+        log.info("Git push OK")
+        return True
 
 # ── Engine ─────────────────────────────────────────────────────────────────
 class Engine:
