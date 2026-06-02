@@ -31,14 +31,14 @@ SERVICE_UI="xui-webui"
 NGINX_CONF="/etc/nginx/sites-available/xui-webui"
 
 G="\033[0;32m"; Y="\033[1;33m"; C="\033[0;36m"; R="\033[0;31m"
-B="\033[1m"; D="\033[2m"; P="\033[0;35m"; RS="\033[0m"
+B="\033[1m"; D="\033[2m"; RS="\033[0m"
 info()    { echo -e "${C}[info]${RS} $*"; }
 ok()      { echo -e "${G}[ ok]${RS} $*"; }
 warn()    { echo -e "${Y}[warn]${RS} $*"; }
 err()     { echo -e "${R}[ err]${RS} $*"; exit 1; }
 section() { echo ""; echo -e "${Y}── $* $(printf '─%.0s' $(seq 1 $((42-${#1}))))${RS}"; echo ""; }
-hint()    { echo -e "  ${P}→${RS} $*"; }       # purple hints
-example() { echo -e "  ${D}e.g. $*${RS}"; }    # dim examples
+hint()    { echo -e "  ${G}→${RS} $*"; }       # green hints — clearly visible guidance
+example() { echo -e "  ${D}   e.g. $*${RS}"; }  # dim indented examples
 
 clear
 echo ""
@@ -235,7 +235,7 @@ if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
     read -rp "  Choose [1/2] (default 1): " ACCESS_MODE
     ACCESS_MODE="${ACCESS_MODE:-1}"; echo ""
 
-    NGINX_HTTP_PORT="80"
+    NGINX_HTTP_PORT="$UI_PORT"
     if [[ "$ACCESS_MODE" =~ ^[2]$ ]]; then
         section "Domain Name"
         hint "The domain must point to this server's IP in DNS (A record)."
@@ -244,12 +244,8 @@ if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
         [ -z "$DOMAIN" ] && err "Domain name required for this mode"
         echo ""
 
-        section "Nginx HTTP Port"
-        hint "Port nginx will listen on for the domain  (default: 80)."
-        hint "Change this only if port 80 is already used by something else."
-        read -rp "  Nginx HTTP port [80]: " NGINX_HTTP_PORT
-        NGINX_HTTP_PORT="${NGINX_HTTP_PORT:-80}"
-        echo ""
+        # Domain uses same port as the dashboard — no port 80 involved
+        NGINX_HTTP_PORT="$UI_PORT"
     fi
 
 fi
@@ -289,7 +285,8 @@ if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
     echo "   Dashboard port : $UI_PORT"
     case "$ACCESS_MODE" in
         1) echo "   Access         : IP only (HTTP)" ;;
-        2) echo "   Access         : IP + domain $DOMAIN (HTTP via nginx on port $NGINX_HTTP_PORT)" ;;
+        2) echo "   Access         : IP + domain $DOMAIN (both on port $UI_PORT)" ;;
+        *) echo "   Access         : IP only" ;;
     esac
 fi
 echo ""
@@ -403,7 +400,6 @@ cat > "$INSTALL_DIR/config.json" <<EOF
   "ui_port":        $UI_PORT,
   "domain":         "$DOMAIN",
   "access_mode":    "$ACCESS_MODE",
-  "nginx_http_port": "$NGINX_HTTP_PORT",
 
   "subs_dir":        "$SUBS_DIR_NAME",
   "filename_length": 32,
@@ -417,11 +413,13 @@ ok "config.json written (chmod 600)"
 info "Installing gitsub CLI..."
 cat > /usr/local/bin/gitsub <<EOF
 #!/bin/bash
+# gitsub CLI — opens interactive menu when run with no arguments
 cd $INSTALL_DIR
 exec $INSTALL_DIR/venv/bin/python $INSTALL_DIR/update.py "\$@"
 EOF
 chmod +x /usr/local/bin/gitsub
-ok "gitsub command ready"
+# Verify it works
+/usr/local/bin/gitsub help > /dev/null 2>&1 && ok "gitsub command ready" || warn "gitsub test failed — check $INSTALL_DIR/update.py"
 
 info "Creating systemd services..."
 cat > "/etc/systemd/system/$SERVICE_SYNC.service" <<EOF
@@ -498,7 +496,7 @@ write_nginx_conf() {
     # Write clean HTTP-only config — no SSL, no 443, just port 80 proxy
     cat > "$NGINX_CONF" <<NGINXEOF
 server {
-    listen ${NGINX_HTTP_PORT:-80};
+    listen ${UI_PORT};
     server_name ${domain};
     location / {
         proxy_pass           http://127.0.0.1:${UI_PORT};
@@ -528,7 +526,7 @@ NGINXEOF
     else
         systemctl start nginx
     fi
-    ok "Nginx: http://$domain:${NGINX_HTTP_PORT:-80} → port $UI_PORT"
+    ok "Nginx: http://$domain:$UI_PORT  (domain alias for same port)"
 }
 
 if [ "$ACCESS_MODE" = "2" ] && [ -n "$DOMAIN" ]; then
@@ -553,11 +551,7 @@ if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
     echo "    http://$SERVER_IP:$UI_PORT"
     # Domain HTTP — modes 2 and 3
     if [ "$ACCESS_MODE" = "2" ] && [ -n "$DOMAIN" ]; then
-        if [ "${NGINX_HTTP_PORT:-80}" = "80" ]; then
-            echo "    http://$DOMAIN"
-        else
-            echo "    http://$DOMAIN:$NGINX_HTTP_PORT"
-        fi
+        echo "    http://$DOMAIN:$UI_PORT    (domain)"
     fi
 
     echo ""
