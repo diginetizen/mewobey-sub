@@ -207,7 +207,7 @@ read -rp "  Enable web dashboard? [y/n] (default y): " ENABLE_UI
 ENABLE_UI="${ENABLE_UI:-y}"; echo ""
 
 UI_PORT=2086; UI_USER="admin"; UI_PASS=""; ACCESS_MODE="1"
-DOMAIN=""; SSL_MODE="none"; SSL_CERT=""; SSL_KEY=""; SSL_EMAIL=""; CERTBOT_PORT="80"
+DOMAIN=""
 
 if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
     hint "The dashboard will run only on this port. No other port is used."
@@ -231,15 +231,7 @@ if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
     echo "      → http://YOUR_IP:${UI_PORT}"
     echo "      → http://your.domain:${UI_PORT}"
     echo ""
-    echo "  [3] IP address  +  domain  +  HTTPS  (recommended for production)"
-    echo "      → http://YOUR_IP:${UI_PORT}"
-    echo "      → http://your.domain:${UI_PORT}"
-    echo "      → https://your.domain"
-    echo ""
-    echo "  [4] IP address with HTTPS via cert files"
-    echo "      → https://YOUR_IP:${UI_PORT}"
-    echo ""
-    read -rp "  Choose [1-4] (default 1): " ACCESS_MODE
+    read -rp "  Choose [1/2] (default 1): " ACCESS_MODE
     ACCESS_MODE="${ACCESS_MODE:-1}"; echo ""
 
     if [[ "$ACCESS_MODE" =~ ^[2]$ ]]; then
@@ -340,7 +332,6 @@ submap.json
 venv/
 .venv/
 logs/
-ssl/
 *.pyc
 *.pyo
 __pycache__/
@@ -461,16 +452,25 @@ if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
 fi
 ok "Services started"
 
-# ── nginx / SSL ─────────────────────────────────
+# ── nginx (HTTP only, no SSL) ─────────────────────
 write_nginx_conf() {
     local domain="$1"
-    # Remove the default nginx site that Ubuntu ships — it conflicts
+    # Remove default Ubuntu nginx site
     rm -f /etc/nginx/sites-enabled/default
+
+    # Remove ALL existing configs that use port 443 — leftover SSL blocks from old installs
+    # This is what causes "bind() to 0.0.0.0:443 failed"
+    for conf in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
+        [ -f "$conf" ] && grep -q "listen.*443" "$conf" 2>/dev/null && \
+            { rm -f "$conf"; info "Removed old 443 config: $conf"; }
+    done
+    rm -f /etc/nginx/sites-enabled/xui-webui /etc/nginx/sites-available/xui-webui
 
     # Remove any other config already using this domain
     CONFLICTS=$(grep -rl "server_name.*${domain}" /etc/nginx/sites-enabled/ 2>/dev/null | grep -v xui-webui || true)
     [ -n "$CONFLICTS" ] && echo "$CONFLICTS" | xargs rm -f && info "Removed conflicting nginx configs"
 
+    # Write clean HTTP-only config — no SSL, no 443, just port 80 proxy
     cat > "$NGINX_CONF" <<NGINXEOF
 server {
     listen 80;
@@ -488,18 +488,22 @@ server {
 }
 NGINXEOF
     ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/xui-webui
+    systemctl enable nginx --quiet 2>/dev/null || true
 
-    # Enable and start nginx first, then test config and reload
-    systemctl enable nginx --quiet
-    systemctl start  nginx 2>/dev/null || true
-
-    if nginx -t -q 2>/dev/null; then
-        systemctl reload nginx
-        ok "Nginx: $domain → port $UI_PORT"
-    else
-        warn "Nginx config test failed — check: nginx -t"
-        nginx -t   # show the actual error
+    # Test config BEFORE starting — show exact error if bad
+    if ! nginx -t 2>/tmp/nginx_test_err; then
+        warn "Nginx config test failed:"
+        cat /tmp/nginx_test_err
+        return 1
     fi
+
+    # Start or reload
+    if systemctl is-active nginx --quiet; then
+        systemctl reload nginx
+    else
+        systemctl start nginx
+    fi
+    ok "Nginx: $domain → port $UI_PORT (HTTP)"
 }
 
 if [ "$ACCESS_MODE" = "2" ] && [ -n "$DOMAIN" ]; then
@@ -523,7 +527,7 @@ if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
     echo -e "  ${C}Dashboard URLs:${RS}"
     echo "    http://$SERVER_IP:$UI_PORT"
     # Domain HTTP — modes 2 and 3
-    if [[ "$ACCESS_MODE" =~ ^[23]$ ]] && [ -n "$DOMAIN" ]; then
+    if [ "$ACCESS_MODE" = "2" ] && [ -n "$DOMAIN" ]; then
         echo "    http://$DOMAIN:$UI_PORT"
     fi
 
