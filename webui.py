@@ -322,14 +322,19 @@ body::before{
 .tab-btn:hover{background:var(--surf2);color:var(--txt)}
 .tab-btn.active{background:var(--acc-dim);color:var(--acc)}
 
-.topbar-right{display:flex;align-items:center;gap:8px}
+.topbar-right{display:flex;align-items:center;gap:6px}
+/* All topbar controls same height */
+.topbar-right .btn,
+.topbar-right .theme-toggle,
+.topbar-right .sync-indicator{height:32px}
 
 /* Sync pulse indicator */
 .sync-indicator{
   display:flex;align-items:center;gap:6px;
   font-family:var(--mono);font-size:11px;color:var(--txt3);
-  padding:4px 10px;border-radius:20px;
+  padding:0 10px;border-radius:var(--r-sm);
   border:1px solid var(--brd);background:var(--surf);
+  white-space:nowrap;
 }
 .pulse{
   width:6px;height:6px;border-radius:50%;background:var(--txt3);
@@ -342,7 +347,7 @@ body::before{
 /* ─── Buttons ────────────────────────────────── */
 .btn{
   font-family:var(--sans);font-size:13px;font-weight:500;
-  padding:7px 16px;border-radius:var(--r-sm);border:1px solid var(--brd);
+  padding:0 16px;height:32px;border-radius:var(--r-sm);border:1px solid var(--brd);
   background:var(--surf2);color:var(--txt);cursor:pointer;
   transition:all .15s;white-space:nowrap;display:inline-flex;align-items:center;gap:6px;
 }
@@ -353,8 +358,8 @@ body::before{
 .btn.danger:hover{background:rgba(255,51,102,.08);border-color:var(--err)}
 .btn.ghost{background:transparent;border-color:transparent;color:var(--txt2)}
 .btn.ghost:hover{background:var(--surf2);color:var(--txt)}
-.btn.sm{padding:4px 10px;font-size:12px;border-radius:4px}
-.btn.xs{padding:2px 8px;font-size:11px;border-radius:4px;font-family:var(--mono)}
+.btn.sm{padding:0 12px;height:28px;font-size:12px;border-radius:4px}
+.btn.xs{padding:0 8px;height:24px;font-size:11px;border-radius:4px;font-family:var(--mono)}
 .btn:disabled{opacity:.35;cursor:not-allowed}
 .btn.ok-flash{color:var(--green);border-color:var(--green)!important}
 
@@ -405,9 +410,13 @@ body::before{
 }
 
 /* ─── Table ──────────────────────────────────── */
-.tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.tbl-wrap{
+  overflow-x:auto;-webkit-overflow-scrolling:touch;
+  /* Max height so thead can stick within this container */
+  max-height:calc(100vh - 200px);overflow-y:auto;
+}
 table{width:100%;border-collapse:collapse;min-width:560px}
-thead{position:sticky;top:56px;z-index:10}
+thead{position:sticky;top:0;z-index:10}
 thead th{
   font-family:var(--mono);font-size:10px;font-weight:500;
   text-transform:uppercase;letter-spacing:.08em;color:var(--txt3);
@@ -534,10 +543,12 @@ input[type=number]{-moz-appearance:textfield}
 
 .settings-section{display:none}.settings-section.active{display:block}
 .settings-section h3{
-  font-size:15px;font-weight:600;color:var(--txt);margin-bottom:4px;
+  font-size:16px;font-weight:600;color:var(--txt);
+  margin-bottom:6px;padding-bottom:10px;
+  border-bottom:1px solid var(--brd);
 }
 .settings-section .section-desc{
-  font-size:13px;color:var(--txt3);margin-bottom:20px;
+  font-size:13px;color:var(--txt3);margin-bottom:18px;margin-top:10px;
 }
 .field-group{
   background:var(--surf);border:1px solid var(--brd);border-radius:var(--r);
@@ -568,9 +579,9 @@ input[type=number]{-moz-appearance:textfield}
 
 /* ─── Theme toggle ───────────────────────────── */
 .theme-toggle{
-  width:34px;height:34px;border-radius:var(--r-sm);border:1px solid var(--brd);
+  width:32px;height:32px;border-radius:var(--r-sm);border:1px solid var(--brd);
   background:var(--surf2);color:var(--txt2);cursor:pointer;
-  display:flex;align-items:center;justify-content:center;font-size:15px;
+  display:flex;align-items:center;justify-content:center;font-size:14px;
   transition:all .15s;flex-shrink:0;
 }
 .theme-toggle:hover{border-color:var(--acc);color:var(--acc);background:var(--acc-dim)}
@@ -683,7 +694,7 @@ input[type=number]{-moz-appearance:textfield}
     <button class="btn sm" onclick="copyAllURLs()">copy all URLs</button>
   </div>
 
-  <div class="tbl-wrap">
+  <div class="tbl-wrap" id="tbl-wrap">
     <table>
       <thead>
         <tr>
