@@ -14,6 +14,13 @@ CONFIG_FILE = BASE_DIR / "config.json"
 app  = Flask(__name__)
 PORT = int(os.getenv("PORT", 2086))
 
+def get_flask_port() -> int:
+    """flask_port is the internal port Flask actually binds to.
+    When nginx is in use (access_mode=2), this is UI_PORT+1.
+    When no nginx (access_mode=1), this equals UI_PORT."""
+    cfg = load_cfg()
+    return int(cfg.get("flask_port", PORT))
+
 def load_cfg() -> dict:
     if not CONFIG_FILE.exists(): return {}
     with open(CONFIG_FILE) as f: return json.load(f)
@@ -25,6 +32,14 @@ def save_cfg(d: dict):
 def load_submap() -> dict:
     if not SUBMAP_FILE.exists(): return {}
     with open(SUBMAP_FILE) as f: return json.load(f)
+
+SYNC_STATUS_FILE = BASE_DIR / "sync_status.json"
+
+def read_sync_status() -> dict:
+    if not SYNC_STATUS_FILE.exists():
+        return {"running": False, "error": None}
+    with open(SYNC_STATUS_FILE) as f:
+        return json.load(f)
 
 def fmtts(epoch):
     try: return datetime.utcfromtimestamp(int(epoch)).strftime("%Y-%m-%d %H:%M UTC")
@@ -775,6 +790,7 @@ input[type=number]{-moz-appearance:textfield}
       <button class="settings-nav-item" onclick="switchSection('sync',this)">Sync</button>
       <button class="settings-nav-item" onclick="switchSection('webui',this)">Web UI</button>
       <button class="settings-nav-item" onclick="switchSection('subs',this)">Subscriptions</button>
+      <button class="settings-nav-item" onclick="switchSection('inbounds',this)">Inbounds</button>
       <button class="settings-nav-item" onclick="switchSection('nginx',this)">Nginx</button>
     </nav>
 
@@ -958,6 +974,7 @@ function setSyncPulse(state){
   const l=document.getElementById('sync-label');
   if(state==='syncing'){p.className='pulse active';l.textContent='syncing';}
   else if(state==='ok'){p.className='pulse ok';l.textContent='idle';setTimeout(()=>{p.className='pulse';},3000);}
+  else if(state==='idle'){p.className='pulse';l.textContent='idle';}
   else{p.className='pulse';l.textContent='idle';}
 }
 
@@ -969,12 +986,17 @@ function pollForSyncEnd(){
     if(!d.running){
       clearInterval(pollTimer);
       document.getElementById('sync-btn').disabled=false;
-      setSyncPulse('ok');
       loadUsers();
-      toast('Sync complete ✓','ok');
-      // Refresh service info if tab visible
       if(document.getElementById('panel-services').classList.contains('active'))
         loadSyncInfo();
+      if(d.error){
+        setSyncPulse('idle');
+        toast('Sync done — push failed: '+d.error,'err');
+      } else {
+        setSyncPulse('ok');
+        const changed = d.files_changed!=null ? ` (${d.files_changed} files changed)` : '';
+        toast('Sync complete ✓'+changed,'ok');
+      }
     }
   },2000);
 }
@@ -1106,6 +1128,16 @@ const SECTIONS = {
        note:'Characters in the random part (default: 32)'},
     ]
   },
+  inbounds:{
+    title:'Inbound Filter',
+    desc:'Restrict which inbounds appear in subscription files. Leave empty to include all.',
+    fields:[
+      {k:'inbound_filter', label:'Inbound tags (comma-separated)', type:'text',
+       note:'e.g. vmess-ws,vless-tcp — leave empty to include all inbounds'},
+      {k:'filename_seed',  label:'Filename seed (server secret)', type:'password',
+       note:'Used to generate deterministic filenames — same user always gets same URL'},
+    ]
+  },
   nginx:{
     title:'Nginx & Domain',
     desc:'Configure nginx to serve the dashboard via a custom domain.',
@@ -1226,7 +1258,15 @@ def api_sync():
 
 @app.route("/api/sync/status")
 @login_required
-def api_sync_status(): return jsonify({"running":_syncing})
+def api_sync_status():
+    ss = read_sync_status()
+    return jsonify({
+        "running": _syncing or ss.get("running", False),
+        "error":   ss.get("error"),
+        "push_ok": ss.get("push_ok"),
+        "files_changed": ss.get("files_changed"),
+        "last_ts": ss.get("ts_fmt"),
+    })
 
 @app.route("/api/sync/info")
 @login_required
@@ -1286,5 +1326,14 @@ def api_settings_save():
     return jsonify({"ok":True})
 
 if __name__=="__main__":
-    print(f"  gitsub WebUI → http://0.0.0.0:{PORT}")
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    bind_port = get_flask_port()
+    cfg = load_cfg()
+    mode = cfg.get("access_mode","1")
+    if mode == "2":
+        print(f"  gitsub WebUI (internal) → 127.0.0.1:{bind_port}")
+        print(f"  Public access via nginx → port {cfg.get('ui_port', PORT)}")
+        # Bind to localhost only — nginx handles public traffic
+        app.run(host="127.0.0.1", port=bind_port, debug=False)
+    else:
+        print(f"  gitsub WebUI → http://0.0.0.0:{bind_port}")
+        app.run(host="0.0.0.0", port=bind_port, debug=False)
