@@ -1081,5 +1081,3 @@ if __name__ == "__main__":
 """)
     else:
         print(f"Unknown: {args[0]}. Run 'gitsub help'."); sys.exit(1)
-PYEOF
-python3 -c "import ast; ast.parse(open('/home/claude/mewobey-sub-new/update.py').read()); print('update.py OK')"
