@@ -210,6 +210,7 @@ read -rp "  Enable web dashboard? [y/n] (default y): " ENABLE_UI
 ENABLE_UI="${ENABLE_UI:-y}"; echo ""
 
 UI_PORT=2086; UI_USER="admin"; UI_PASS=""; ACCESS_MODE="1"
+FLASK_PORT=2087
 DOMAIN=""
 
 if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
@@ -235,7 +236,13 @@ if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
     read -rp "  Choose [1/2] (default 1): " ACCESS_MODE
     ACCESS_MODE="${ACCESS_MODE:-1}"; echo ""
 
-    NGINX_HTTP_PORT="$UI_PORT"
+    if [[ "$ACCESS_MODE" =~ ^[2]$ ]]; then
+        # Mode 2: nginx owns UI_PORT; Flask binds to UI_PORT+1 (private)
+        FLASK_PORT=$(( UI_PORT + 1 ))
+    else
+        # Mode 1: no nginx; Flask binds directly to UI_PORT
+        FLASK_PORT=$UI_PORT
+    fi
     if [[ "$ACCESS_MODE" =~ ^[2]$ ]]; then
         section "Domain Name"
         hint "The domain must point to this server's IP in DNS (A record)."
@@ -244,8 +251,7 @@ if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
         [ -z "$DOMAIN" ] && err "Domain name required for this mode"
         echo ""
 
-        # Domain uses same port as the dashboard — no port 80 involved
-        NGINX_HTTP_PORT="$UI_PORT"
+
     fi
 
 fi
@@ -285,7 +291,7 @@ if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
     echo "   Dashboard port : $UI_PORT"
     case "$ACCESS_MODE" in
         1) echo "   Access         : IP only (HTTP)" ;;
-        2) echo "   Access         : IP + domain $DOMAIN (both on port $UI_PORT)" ;;
+        2) echo "   Access         : IP + domain $DOMAIN on port $UI_PORT  (Flask on $(( UI_PORT + 1 )))" ;;
         *) echo "   Access         : IP only" ;;
     esac
 fi
@@ -381,6 +387,8 @@ else
 fi
 ok "Git configured"
 
+# Generate a server-secret seed for deterministic filenames
+FILENAME_SEED=$(python3 -c "import secrets; print(secrets.token_hex(24))")
 info "Writing config.json..."
 cat > "$INSTALL_DIR/config.json" <<EOF
 {
@@ -398,12 +406,15 @@ cat > "$INSTALL_DIR/config.json" <<EOF
   "ui_user":        "$UI_USER",
   "ui_pass":        "$UI_PASS",
   "ui_port":        $UI_PORT,
+  "flask_port":     $FLASK_PORT,
   "domain":         "$DOMAIN",
   "access_mode":    "$ACCESS_MODE",
 
   "subs_dir":        "$SUBS_DIR_NAME",
   "filename_length": 32,
   "filename_mode":   "$FILENAME_MODE",
+  "filename_seed":   "$FILENAME_SEED",
+  "inbound_filter":  [],
   "sync_interval":   $INTERVAL
 }
 EOF
@@ -451,7 +462,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=$INSTALL_DIR
-Environment=PORT=$UI_PORT
+Environment=PORT=$FLASK_PORT
 ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/webui.py
 Restart=always
 RestartSec=10
@@ -494,12 +505,33 @@ write_nginx_conf() {
     [ -n "$CONFLICTS" ] && echo "$CONFLICTS" | xargs rm -f && info "Removed conflicting nginx configs"
 
     # Write clean HTTP-only config — no SSL, no 443, just port 80 proxy
+    local flask_p=$(( UI_PORT + 1 ))
     cat > "$NGINX_CONF" <<NGINXEOF
+# gitsub nginx — listens on port ${UI_PORT}, proxies to Flask on ${flask_p}
+# Both http://IP:${UI_PORT} and http://domain:${UI_PORT} work via this config
+
+# Named server block for the domain
 server {
     listen ${UI_PORT};
     server_name ${domain};
     location / {
-        proxy_pass           http://127.0.0.1:${UI_PORT};
+        proxy_pass           http://127.0.0.1:${flask_p};
+        proxy_set_header     Host \$host;
+        proxy_set_header     X-Real-IP \$remote_addr;
+        proxy_set_header     X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header     X-Forwarded-Proto \$scheme;
+        proxy_read_timeout   60;
+        proxy_http_version   1.1;
+        proxy_buffering      off;
+    }
+}
+
+# Catch-all: direct IP access on same port also proxies to Flask
+server {
+    listen ${UI_PORT} default_server;
+    server_name _;
+    location / {
+        proxy_pass           http://127.0.0.1:${flask_p};
         proxy_set_header     Host \$host;
         proxy_set_header     X-Real-IP \$remote_addr;
         proxy_set_header     X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -526,7 +558,7 @@ NGINXEOF
     else
         systemctl start nginx
     fi
-    ok "Nginx: http://$domain:$UI_PORT  (domain alias for same port)"
+    ok "Nginx: port $UI_PORT → Flask on $(( UI_PORT + 1 ))  (IP + domain both work)"
 }
 
 if [ "$ACCESS_MODE" = "2" ] && [ -n "$DOMAIN" ]; then
@@ -535,6 +567,18 @@ if [ "$ACCESS_MODE" = "2" ] && [ -n "$DOMAIN" ]; then
         ufw allow 80/tcp --comment "gitsub nginx" >/dev/null 2>&1 || true
 fi
 
+
+# ── First sync ───────────────────────────────────
+section "First Sync"
+hint "Run a sync now to populate your GitHub repo with subscription files."
+read -rp "  Run first sync now? [y/n] (default y): " DO_FIRST_SYNC
+DO_FIRST_SYNC="${DO_FIRST_SYNC:-y}"
+if [[ "$DO_FIRST_SYNC" =~ ^[Yy] ]]; then
+    info "Running first sync..."
+    "$INSTALL_DIR/venv/bin/python" "$INSTALL_DIR/update.py" sync \
+        && ok "First sync complete" \
+        || warn "First sync failed — run 'gitsub sync' to retry"
+fi
 
 # ── Done ────────────────────────────────────────
 SERVER_IP=$(hostname -I | awk '{print $1}')
