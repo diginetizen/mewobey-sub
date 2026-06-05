@@ -304,6 +304,9 @@ class Git:
         self.ensure_remote()
         self.bootstrap_repo()
 
+        # ══════════════ FIX: pull/rebase BEFORE staging ══════════════
+        self.pull_rebase()
+
         subs_dir = self.cfg.subs_dir
         subs_path = BASE_DIR / subs_dir
         subs_path.mkdir(exist_ok=True)
@@ -330,7 +333,6 @@ class Git:
             log.info("No subs changes staged")
             return False
 
-        self.pull_rebase()
         ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
         self._run(["git","commit","-m",f"sync {ts}"])
 
