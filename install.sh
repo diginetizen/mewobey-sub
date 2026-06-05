@@ -31,14 +31,17 @@ SERVICE_UI="xui-webui"
 NGINX_CONF="/etc/nginx/sites-available/xui-webui"
 
 G="\033[0;32m"; Y="\033[1;33m"; C="\033[0;36m"; R="\033[0;31m"
-B="\033[1m"; D="\033[2m"; RS="\033[0m"
+B="\033[1m"; D="\033[2m"; LC="\033[0;96m"; LY="\033[0;93m"; RS="\033[0m"
+# LC = light cyan (hints), LY = light yellow (notes/warnings)
 info()    { echo -e "${C}[info]${RS} $*"; }
 ok()      { echo -e "${G}[ ok]${RS} $*"; }
 warn()    { echo -e "${Y}[warn]${RS} $*"; }
 err()     { echo -e "${R}[ err]${RS} $*"; exit 1; }
 section() { echo ""; echo -e "${Y}── $* $(printf '─%.0s' $(seq 1 $((42-${#1}))))${RS}"; echo ""; }
-hint()    { echo -e "  ${G}→${RS} $*"; }       # green hints — clearly visible guidance
-example() { echo -e "  ${D}   e.g. $*${RS}"; }  # dim indented examples
+hint()    { echo -e "  ${LC}ℹ${RS} $*"; }          # light cyan info hints
+note()    { echo -e "  ${LY}⚠${RS} $*"; }          # light yellow warnings
+example() { echo -e "  ${D}  e.g. $*${RS}"; }      # dim indented examples
+label()   { echo -e "  ${B}$*${RS}"; }             # bold labels
 
 clear
 echo ""
@@ -178,7 +181,9 @@ SSHEOF
 else
     section "GitHub Token"
     hint "Create one at: https://github.com/settings/tokens"
-    hint "Select scope: repo  (gives full repository access)"
+    hint "Create at: https://github.com/settings/tokens → Classic token"
+    hint "Required scope: repo  (full repository access)"
+    note "This token is stored in config.json (chmod 600) — never pushed to GitHub."
     example "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     GITHUB_TOKEN=$(masked_input "  Personal Access Token: ")
     echo ""; echo ""
@@ -225,13 +230,15 @@ if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
     echo ""; echo ""
 
     section "Access Mode"
-    hint "How do you want to reach the dashboard?"
+    hint "How will users (and you) reach the dashboard?"
     echo ""
-    echo "  [1] IP address only"
+    echo "  [1] IP address only  — simplest, no nginx needed"
     example "http://YOUR_IP:${UI_PORT}"
     echo ""
-    echo "  [2] Domain name via nginx  (HTTP proxy)"
-    example "http://YOUR_IP:${UI_PORT}  and  http://your.domain:${UI_PORT}"
+    echo "  [2] IP address + domain  — nginx routes both to same port"
+    example "http://YOUR_IP:${UI_PORT}"
+    example "http://your.domain:${UI_PORT}"
+    note "Your domain DNS must have an A record pointing to this server IP."
     echo ""
     read -rp "  Choose [1/2] (default 1): " ACCESS_MODE
     ACCESS_MODE="${ACCESS_MODE:-1}"; echo ""
@@ -245,8 +252,9 @@ if [[ "$ENABLE_UI" =~ ^[Yy] ]]; then
     fi
     if [[ "$ACCESS_MODE" =~ ^[2]$ ]]; then
         section "Domain Name"
-        hint "The domain must point to this server's IP in DNS (A record)."
-        example "sub.example.com  →  your server IP"
+        hint "Domain must point to this server in DNS (A record)."
+        note "DNS changes can take a few minutes to propagate."
+        example "sub.example.com  →  your server IP  (check with: nslookup sub.example.com)"
         read -rp "  Domain name: " DOMAIN
         [ -z "$DOMAIN" ] && err "Domain name required for this mode"
         echo ""
