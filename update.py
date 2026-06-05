@@ -239,28 +239,55 @@ class Git:
             self._run(["git","remote","set-url","origin",url])
 
     def ensure_gitignore(self):
-        """Make sure .gitignore exists and is committed so project files stay untracked."""
+        """Write .gitignore covering all project files. Stage and push it if not yet tracked."""
         gi = BASE_DIR / ".gitignore"
-        content = "\n".join([
-            "# gitsub — never push these",
-            "config.json", "submap.json", "sync_status.json",
-            "venv/", ".venv/", "logs/", "ssl/",
-            "*.pyc", "*.pyo", "__pycache__/",
-            ".DS_Store", "Thumbs.db", ".env", ".env.*",
+        lines = [
+            "# gitsub — never commit these",
+            "config.json",
+            "submap.json",
+            "sync_status.json",
+            "venv/",
+            ".venv/",
+            "logs/",
+            "ssl/",
+            "*.pyc",
+            "*.pyo",
+            "__pycache__/",
+            ".DS_Store",
+            "Thumbs.db",
+            ".env",
+            ".env.*",
             "*.bak",
-        ])
-        if not gi.exists() or gi.read_text().strip() != content.strip():
-            gi.write_text(content)
+            # Explicitly ignore every project file so they never appear as untracked
+            "update.py",
+            "webui.py",
+            "requirements.txt",
+            "uninstall.sh",
+            "install.sh",
+            "version.txt",
+        ]
+        content = "\n".join(lines) + "\n"
+        gi.write_text(content)
 
-        # Check if .gitignore is tracked; if not, add it
+    def bootstrap_repo(self):
+        """
+        Ensure git is initialised and .gitignore is committed.
+        Must be called before any push. Safe to call repeatedly.
+        """
+        # Init if needed
+        if not (BASE_DIR / ".git").exists():
+            self._run(["git","init","-q"])
+            self._run(["git","branch","-M",self.cfg.github_branch], check=False)
+
+        self.ensure_gitignore()
+
+        # If .gitignore is not yet tracked, make an initial commit with it
         r = self._run(["git","ls-files","--error-unmatch",".gitignore"], check=False)
         if r.returncode != 0:
-            # Commit .gitignore first so subsequent commits don't see untracked project files
             self._run(["git","add",".gitignore"])
-            r2 = self._run(["git","status","--porcelain"], check=False)
-            if r2.stdout.strip():
-                self._run(["git","commit","--allow-empty","-m","add .gitignore"])
-                log.info("Committed .gitignore")
+            # Use --allow-empty so this never fails even on a fresh repo
+            self._run(["git","commit","--allow-empty","-m","init: add .gitignore"])
+            log.info("Bootstrapped repo with .gitignore")
 
     def pull_rebase(self):
         try:
@@ -275,22 +302,33 @@ class Git:
 
     def push(self) -> bool:
         self.ensure_remote()
-        self.ensure_gitignore()
+        self.bootstrap_repo()
 
         subs_dir = self.cfg.subs_dir
-        # ONLY stage the subs folder — nothing else
-        self._run(["git","add","--","f{subs_dir}/".replace("f","")], check=False)
-        # Use exact path
-        subprocess.run(["git","add","--",f"{subs_dir}/"], cwd=BASE_DIR, capture_output=True)
+        subs_path = BASE_DIR / subs_dir
+        subs_path.mkdir(exist_ok=True)
 
-        status = self._run(["git","status","--porcelain"], check=False).stdout.strip()
-        if not status:
-            log.info("Nothing to push"); return False
+        # Stage ONLY the subs folder — nothing else ever touches the index
+        subprocess.run(
+            ["git","add","--",f"{subs_dir}/"],
+            cwd=BASE_DIR, capture_output=True
+        )
 
-        # Make sure only subs dir changes are staged
-        staged = [l for l in status.splitlines() if l.startswith(("A ","M ","D ")) and subs_dir in l]
-        if not staged:
-            log.info("No subs changes to push"); return False
+        # Check what is actually staged (index vs HEAD)
+        staged_out = self._run(
+            ["git","diff","--cached","--name-only"], check=False
+        ).stdout.strip()
+
+        if not staged_out:
+            log.info("Nothing staged in subs/ — nothing to push")
+            return False
+
+        # Only commit if staged files are inside subs_dir
+        staged_files = staged_out.splitlines()
+        subs_staged  = [f for f in staged_files if f.startswith(subs_dir + "/") or f.startswith(subs_dir)]
+        if not subs_staged:
+            log.info("No subs changes staged")
+            return False
 
         self.pull_rebase()
         ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
