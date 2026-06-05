@@ -377,6 +377,8 @@ body::before{
 .btn.xs{padding:0 8px;height:24px;font-size:11px;border-radius:4px;font-family:var(--mono)}
 .btn:disabled{opacity:.35;cursor:not-allowed}
 .btn.ok-flash{color:var(--green);border-color:var(--green)!important}
+.inbound-chip{border-radius:20px!important;font-size:10px!important}
+.chip-active{background:var(--acc-dim)!important;border-color:var(--acc)!important;color:var(--acc)!important}
 
 /* ─── Panels ─────────────────────────────────── */
 .panel{display:none}.panel.active{display:block}
@@ -707,6 +709,20 @@ input[type=number]{-moz-appearance:textfield}
     <span class="count-badge" id="count-badge"></span>
     <button class="btn sm" id="sort-btn" onclick="toggleSort()">↑↓ A–Z</button>
     <button class="btn sm" onclick="copyAllURLs()">copy all URLs</button>
+    <button class="btn sm" id="filter-btn" onclick="toggleFilterPanel()" title="Show inbound filter">⚙ filter</button>
+  </div>
+  <!-- Inline filter panel -->
+  <div id="filter-panel" style="display:none;padding:12px 20px;border-bottom:1px solid var(--brd);background:var(--surf2)">
+    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+      <div style="font-family:var(--mono);font-size:11px;color:var(--txt3);min-width:80px">Inbound filter:</div>
+      <div id="inbound-chips" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+      <div style="font-family:var(--mono);font-size:11px;color:var(--txt3)">Active:</div>
+      <div id="active-filter-label" style="font-family:var(--mono);font-size:11px;color:var(--acc)">all</div>
+    </div>
+    <div style="margin-top:10px;font-family:var(--mono);font-size:10px;color:var(--txt3)">
+      Click an inbound to show only users whose sub URL contains that tag.
+      <a href="#" onclick="clearInboundFilter();return false" style="color:var(--acc);margin-left:8px">clear</a>
+    </div>
   </div>
 
   <div class="tbl-wrap" id="tbl-wrap">
@@ -805,7 +821,43 @@ input[type=number]{-moz-appearance:textfield}
 
 <script>
 // ── State ────────────────────────────────────
-let rows=[], sortDir='asc', pollTimer=null;
+let rows=[], sortDir='asc', pollTimer=null, activeInbound=null;
+
+// ── Inbound filter ───────────────────────────
+function toggleFilterPanel(){
+  const p=document.getElementById('filter-panel');
+  p.style.display=p.style.display==='none'?'block':'none';
+}
+
+function setInboundFilter(tag){
+  activeInbound=tag;
+  document.getElementById('active-filter-label').textContent=tag||'all';
+  document.querySelectorAll('.inbound-chip').forEach(c=>{
+    c.classList.toggle('chip-active', c.dataset.tag===tag);
+  });
+  filterTable();
+}
+
+function clearInboundFilter(){
+  setInboundFilter(null);
+}
+
+function buildInboundChips(data){
+  // Extract unique inbound tags from all raw_urls (text after last #)
+  const tags=new Set();
+  data.forEach(r=>{
+    if(r.raw_url){
+      const tag=r.raw_url.split('#').pop();
+      if(tag&&tag.length>0&&tag.length<60) tags.add(decodeURIComponent(tag).split(' ')[0]);
+    }
+  });
+  const wrap=document.getElementById('inbound-chips');
+  wrap.innerHTML=[...tags].sort().map(t=>`
+    <button class="inbound-chip btn xs" data-tag="${esc(t)}"
+      onclick="setInboundFilter('${esc(t)}')"
+      style="border-color:var(--brd2)">${esc(t)}</button>
+  `).join('');
+}
 
 // ── Theme ────────────────────────────────────
 function initTheme(){
@@ -854,6 +906,7 @@ async function loadUsers(){
   const d = await r.json();
   rows = d.entries;
   applySortAndRender();
+  buildInboundChips(rows);
   document.getElementById('stat-total').textContent = d.total;
   document.getElementById('stat-repo').textContent  = d.repo || '—';
   document.getElementById('stat-sync').textContent  = d.last_sync || 'never';
@@ -869,12 +922,18 @@ function applySortAndRender(){
 
 function filterTable(){
   const q = document.getElementById('search').value.toLowerCase();
-  const filtered = q
+  let filtered = q
     ? rows.filter(r=>(r.email||'').toLowerCase().includes(q)||(r.sub_id||'').toLowerCase().includes(q))
-    : rows;
+    : [...rows];
+  // Apply inbound filter if active
+  if(activeInbound){
+    filtered=filtered.filter(r=>(r.raw_url||'').includes(activeInbound));
+  }
   renderRows(filtered);
+  const total=rows.length;
+  const shown=filtered.length;
   document.getElementById('count-badge').textContent =
-    q ? `${filtered.length} of ${rows.length}` : `${rows.length} users`;
+    shown===total ? `${total} users` : `${shown} of ${total}`;
 }
 
 function renderRows(data){
